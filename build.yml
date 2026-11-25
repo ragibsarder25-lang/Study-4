@@ -1,0 +1,2083 @@
+name: Build StudyOS APK
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.9"
+
+      - name: Generate project sources
+        run: |
+          mkdir -p "app"
+          cat > "app/build.gradle.kts" <<'EOF_00'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+              id("org.jetbrains.kotlin.plugin.compose")
+              id("com.google.devtools.ksp")
+              id("com.google.dagger.hilt.android")
+          }
+
+          android {
+              namespace = "com.ragib.studyos"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.ragib.studyos"
+                  minSdk = 26
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              buildTypes { release { isMinifyEnabled = false } }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+              buildFeatures { compose = true }
+              packaging { resources.excludes += "/META-INF/{AL2.0,LGPL2.1}" }
+          }
+
+          dependencies {
+              implementation(platform("androidx.compose:compose-bom:2024.09.00"))
+              implementation("androidx.compose.ui:ui")
+              implementation("androidx.compose.ui:ui-graphics")
+              implementation("androidx.compose.material3:material3")
+              implementation("androidx.activity:activity-compose:1.9.2")
+              implementation("androidx.lifecycle:lifecycle-runtime-compose:2.8.6")
+              implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.8.6")
+              implementation("androidx.navigation:navigation-compose:2.8.0")
+              implementation("com.google.dagger:hilt-android:2.51.1")
+              ksp("com.google.dagger:hilt-compiler:2.51.1")
+              implementation("androidx.hilt:hilt-navigation-compose:1.2.0")
+              implementation("androidx.room:room-runtime:2.6.1")
+              implementation("androidx.room:room-ktx:2.6.1")
+              ksp("androidx.room:room-compiler:2.6.1")
+              implementation("androidx.datastore:datastore-preferences:1.1.1")
+              implementation("androidx.work:work-runtime-ktx:2.9.1")
+              implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
+          }
+          EOF_00
+          mkdir -p "app/src/main"
+          cat > "app/src/main/AndroidManifest.xml" <<'EOF_01'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+              <uses-permission android:name="android.permission.VIBRATE" />
+              <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+              <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+
+              <application
+                  android:name=".StudyApp"
+                  android:label="StudyOS"
+                  android:allowBackup="true"
+                  android:supportsRtl="true"
+                  android:theme="@style/Theme.StudyOS">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:launchMode="singleTop"
+                      android:windowSoftInputMode="adjustResize">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+                  <service
+                      android:name=".system.TimerService"
+                      android:exported="false"
+                      android:foregroundServiceType="specialUse">
+                      <property
+                          android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                          android:value="study_countdown_timer" />
+                  </service>
+                  <receiver android:name=".system.AlarmReceiver" android:exported="false" />
+                  <receiver android:name=".system.BootReceiver" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.BOOT_COMPLETED" />
+                          <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+                          <action android:name="android.intent.action.TIMEZONE_CHANGED" />
+                      </intent-filter>
+                  </receiver>
+              </application>
+          </manifest>
+          EOF_01
+          mkdir -p "app/src/main/java/com/ragib/studyos"
+          cat > "app/src/main/java/com/ragib/studyos/Di.kt" <<'EOF_02'
+          package com.ragib.studyos
+
+          import android.content.Context
+          import androidx.room.Room
+          import com.ragib.studyos.data.AppDb
+          import dagger.Module
+          import dagger.Provides
+          import dagger.hilt.InstallIn
+          import dagger.hilt.android.qualifiers.ApplicationContext
+          import dagger.hilt.components.SingletonComponent
+          import javax.inject.Singleton
+
+          @Module
+          @InstallIn(SingletonComponent::class)
+          object DbModule {
+              @Provides @Singleton
+              fun db(@ApplicationContext c: Context): AppDb = Room.databaseBuilder(c, AppDb::class.java, "studyos.db").build()
+
+              @Provides
+              fun dao(db: AppDb) = db.dao()
+          }
+          EOF_02
+          mkdir -p "app/src/main/java/com/ragib/studyos"
+          cat > "app/src/main/java/com/ragib/studyos/MainActivity.kt" <<'EOF_03'
+          package com.ragib.studyos
+
+          import android.Manifest
+          import android.content.pm.PackageManager
+          import android.os.Build
+          import android.os.Bundle
+          import androidx.activity.ComponentActivity
+          import androidx.activity.compose.rememberLauncherForActivityResult
+          import androidx.activity.compose.setContent
+          import androidx.activity.result.contract.ActivityResultContracts
+          import androidx.compose.foundation.layout.*
+          import androidx.compose.material3.*
+          import androidx.compose.runtime.*
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.graphics.Color
+          import androidx.compose.ui.platform.LocalContext
+          import androidx.core.content.ContextCompat
+          import androidx.hilt.navigation.compose.hiltViewModel
+          import androidx.lifecycle.Lifecycle
+          import androidx.lifecycle.compose.LifecycleEventEffect
+          import androidx.lifecycle.compose.collectAsStateWithLifecycle
+          import androidx.navigation.compose.NavHost
+          import androidx.navigation.compose.composable
+          import androidx.navigation.compose.currentBackStackEntryAsState
+          import androidx.navigation.compose.rememberNavController
+          import com.ragib.studyos.domain.U
+          import com.ragib.studyos.ui.*
+          import dagger.hilt.android.AndroidEntryPoint
+
+          @AndroidEntryPoint
+          class MainActivity : ComponentActivity() {
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  setContent { AppRoot() }
+              }
+          }
+
+          @Composable
+          fun AppRoot() {
+              val home: HomeViewModel = hiltViewModel()
+              val library: LibraryViewModel = hiltViewModel()
+              val stats: StatsViewModel = hiltViewModel()
+              val settings: SettingsViewModel = hiltViewModel()
+              val prefs by home.prefs.collectAsStateWithLifecycle()
+              StudyTheme(prefs.accent) {
+                  val nav = rememberNavController()
+                  val route = nav.currentBackStackEntryAsState().value?.destination?.route
+                  val ctx = LocalContext.current
+                  val perm = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) {}
+                  LaunchedEffect(Unit) {
+                      if (Build.VERSION.SDK_INT >= 33 && ContextCompat.checkSelfPermission(ctx, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED)
+                          perm.launch(Manifest.permission.POST_NOTIFICATIONS)
+                  }
+                  LifecycleEventEffect(Lifecycle.Event.ON_RESUME) { home.refresh() }
+                  val snack = remember { SnackbarHostState() }
+                  LaunchedEffect(Unit) { home.message.collect { snack.showSnackbar(it) } }
+                  val ts by home.timer.state.collectAsStateWithLifecycle()
+                  val burst by home.burst.collectAsStateWithLifecycle()
+
+                  Scaffold(
+                      containerColor = Color.Black,
+                      snackbarHost = { SnackbarHost(snack) },
+                      bottomBar = {
+                          if (route != "focus") NavigationBar(containerColor = Color.Black) {
+                              listOf(Triple("today", "Today", "◉"), Triple("library", "Library", "▤"), Triple("stats", "Progress", "◔"), Triple("settings", "Settings", "⚙")).forEach { (r, l, i) ->
+                                  NavigationBarItem(selected = route == r, onClick = { nav.navigate(r) { launchSingleTop = true; popUpTo("today") } },
+                                      icon = { Text(i) }, label = { Text(l) })
+                              }
+                          }
+                      }
+                  ) { pad ->
+                      Box(Modifier.padding(pad).fillMaxSize()) {
+                          NavHost(nav, "today") {
+                              composable("today") { TodayScreen(home) { nav.navigate("focus") { launchSingleTop = true } } }
+                              composable("focus") { FocusScreen(home) { nav.popBackStack() } }
+                              composable("library") { LibraryScreen(library) }
+                              composable("stats") { StatsScreen(stats) }
+                              composable("settings") { SettingsScreen(settings) }
+                          }
+                          Burst(burst.first, periodColor(burst.second))
+                      }
+                  }
+
+                  if (ts.state == "FINISHED") {
+                      if (ts.isBreak) {
+                          LaunchedEffect(ts) { home.timer.reset(); home.message.tryEmit("Break over — back to it") }
+                      } else if (ts.taskId != null) {
+                          RateDialog("Session complete: ${ts.title}", { u: Int -> home.complete(ts.taskId!!, u, ts.period); home.timer.reset() }, { home.timer.reset() }) {
+                              TextButton({ home.startBreak() }) { Text("Start ${prefs.breakMin}-min break") }
+                          }
+                      } else {
+                          AlertDialog(onDismissRequest = { home.timer.reset() }, containerColor = Panel, title = { Text("Session complete") },
+                              text = { Text("Nice work.") },
+                              confirmButton = { TextButton({ home.timer.reset() }) { Text("OK") } },
+                              dismissButton = { TextButton({ home.startBreak() }) { Text("Start break") } })
+                      }
+                  }
+              }
+          }
+          EOF_03
+          mkdir -p "app/src/main/java/com/ragib/studyos"
+          cat > "app/src/main/java/com/ragib/studyos/StudyApp.kt" <<'EOF_04'
+          package com.ragib.studyos
+
+          import android.app.Application
+          import androidx.work.ExistingPeriodicWorkPolicy
+          import androidx.work.PeriodicWorkRequestBuilder
+          import androidx.work.WorkManager
+          import com.ragib.studyos.system.PlanWorker
+          import dagger.hilt.android.HiltAndroidApp
+          import java.util.concurrent.TimeUnit
+
+          @HiltAndroidApp
+          class StudyApp : Application() {
+              override fun onCreate() {
+                  super.onCreate()
+                  WorkManager.getInstance(this).enqueueUniquePeriodicWork(
+                      "daily_plan", ExistingPeriodicWorkPolicy.KEEP,
+                      PeriodicWorkRequestBuilder<PlanWorker>(12, TimeUnit.HOURS).build()
+                  )
+              }
+          }
+          EOF_04
+          mkdir -p "app/src/main/java/com/ragib/studyos/data"
+          cat > "app/src/main/java/com/ragib/studyos/data/Dao.kt" <<'EOF_05'
+          package com.ragib.studyos.data
+
+          import androidx.room.*
+          import kotlinx.coroutines.flow.Flow
+
+          @Dao
+          interface StudyDao {
+              @Query("SELECT * FROM subjects ORDER BY createdAt") fun subjects(): Flow<List<SubjectEntity>>
+              @Query("SELECT * FROM subjects") suspend fun subjectsNow(): List<SubjectEntity>
+              @Insert suspend fun insertSubject(s: SubjectEntity): Long
+              @Update suspend fun updateSubject(s: SubjectEntity)
+              @Delete suspend fun deleteSubject(s: SubjectEntity)
+              @Insert(onConflict = OnConflictStrategy.REPLACE) suspend fun putSubjects(l: List<SubjectEntity>)
+
+              @Query("SELECT * FROM topics ORDER BY subjectId, orderIndex, id") fun topics(): Flow<List<TopicEntity>>
+              @Query("SELECT * FROM topics") suspend fun topicsNow(): List<TopicEntity>
+              @Query("SELECT * FROM topics WHERE id=:id") suspend fun topic(id: Long): TopicEntity?
+              @Query("SELECT COALESCE(MAX(orderIndex),0) FROM topics WHERE subjectId=:sid") suspend fun maxOrder(sid: Long): Int
+              @Insert suspend fun insertTopics(l: List<TopicEntity>)
+              @Update suspend fun updateTopic(t: TopicEntity)
+              @Delete suspend fun deleteTopic(t: TopicEntity)
+              @Insert(onConflict = OnConflictStrategy.REPLACE) suspend fun putTopics(l: List<TopicEntity>)
+
+              @Query("SELECT * FROM tasks WHERE day=:day ORDER BY id") fun tasksForDay(day: Long): Flow<List<DailyTaskEntity>>
+              @Query("SELECT * FROM tasks WHERE day=:day ORDER BY id") suspend fun tasksForDayNow(day: Long): List<DailyTaskEntity>
+              @Query("SELECT * FROM tasks ORDER BY day") fun allTasks(): Flow<List<DailyTaskEntity>>
+              @Query("SELECT * FROM tasks") suspend fun tasksNow(): List<DailyTaskEntity>
+              @Query("SELECT * FROM tasks WHERE id=:id") suspend fun task(id: Long): DailyTaskEntity?
+              @Query("SELECT * FROM tasks WHERE topicId=:tid") suspend fun tasksOfTopic(tid: Long): List<DailyTaskEntity>
+              @Query("SELECT * FROM tasks WHERE status='PENDING' AND day<:day") suspend fun stalePending(day: Long): List<DailyTaskEntity>
+              @Query("SELECT * FROM tasks WHERE status='INCOMPLETE'") suspend fun incompleteNow(): List<DailyTaskEntity>
+              @Insert(onConflict = OnConflictStrategy.IGNORE) suspend fun insertTask(t: DailyTaskEntity): Long
+              @Insert(onConflict = OnConflictStrategy.REPLACE) suspend fun putTasks(l: List<DailyTaskEntity>)
+              @Update suspend fun updateTask(t: DailyTaskEntity)
+              @Query("DELETE FROM tasks WHERE topicId=:tid") suspend fun deleteTasksOfTopic(tid: Long)
+
+              @Query("SELECT * FROM revisions") suspend fun revisionsNow(): List<RevisionScheduleEntity>
+              @Query("SELECT * FROM revisions WHERE done=0 AND dueDay<=:day") suspend fun dueRevisions(day: Long): List<RevisionScheduleEntity>
+              @Query("SELECT * FROM revisions WHERE topicId=:tid") suspend fun revisionsOfTopic(tid: Long): List<RevisionScheduleEntity>
+              @Query("SELECT * FROM revisions WHERE id=:id") suspend fun revision(id: Long): RevisionScheduleEntity?
+              @Insert(onConflict = OnConflictStrategy.REPLACE) suspend fun putRevision(r: RevisionScheduleEntity): Long
+              @Insert(onConflict = OnConflictStrategy.REPLACE) suspend fun putRevisions(l: List<RevisionScheduleEntity>)
+              @Query("DELETE FROM revisions WHERE topicId=:tid") suspend fun deleteRevisionsOfTopic(tid: Long)
+
+              @Insert suspend fun insertSession(s: StudySessionEntity): Long
+              @Query("SELECT * FROM sessions ORDER BY startedAt DESC") fun sessions(): Flow<List<StudySessionEntity>>
+              @Query("SELECT * FROM sessions") suspend fun sessionsNow(): List<StudySessionEntity>
+              @Insert(onConflict = OnConflictStrategy.REPLACE) suspend fun putSessions(l: List<StudySessionEntity>)
+
+              @Insert suspend fun insertHistory(h: RevisionHistoryEntity): Long
+              @Query("SELECT * FROM history ORDER BY id") fun history(): Flow<List<RevisionHistoryEntity>>
+              @Query("SELECT * FROM history") suspend fun historyNow(): List<RevisionHistoryEntity>
+              @Query("DELETE FROM history WHERE id=(SELECT MAX(id) FROM history WHERE topicId=:tid)") suspend fun deleteLastHistory(tid: Long)
+              @Insert(onConflict = OnConflictStrategy.REPLACE) suspend fun putHistory(l: List<RevisionHistoryEntity>)
+
+              @Insert suspend fun insertUndo(u: UndoEntity)
+              @Query("SELECT * FROM undo ORDER BY id DESC LIMIT 1") suspend fun lastUndo(): UndoEntity?
+              @Query("SELECT COUNT(*) FROM undo") fun undoCount(): Flow<Int>
+              @Delete suspend fun deleteUndo(u: UndoEntity)
+              @Query("DELETE FROM undo WHERE id NOT IN (SELECT id FROM undo ORDER BY id DESC LIMIT 20)") suspend fun trimUndo()
+
+              @Query("DELETE FROM sessions") suspend fun clearSessions()
+              @Query("DELETE FROM history") suspend fun clearHistory()
+              @Query("DELETE FROM undo") suspend fun clearUndo()
+              @Query("DELETE FROM tasks") suspend fun clearTasks()
+              @Query("DELETE FROM revisions") suspend fun clearRevisions()
+              @Query("DELETE FROM topics") suspend fun clearTopics()
+              @Query("DELETE FROM subjects") suspend fun clearSubjects()
+          }
+
+          @Database(
+              entities = [SubjectEntity::class, TopicEntity::class, DailyTaskEntity::class, RevisionScheduleEntity::class,
+                  StudySessionEntity::class, RevisionHistoryEntity::class, UndoEntity::class],
+              version = 1, exportSchema = false
+          )
+          abstract class AppDb : RoomDatabase() { abstract fun dao(): StudyDao }
+          EOF_05
+          mkdir -p "app/src/main/java/com/ragib/studyos/data"
+          cat > "app/src/main/java/com/ragib/studyos/data/Entities.kt" <<'EOF_06'
+          package com.ragib.studyos.data
+
+          import androidx.room.*
+          import org.json.JSONArray
+          import org.json.JSONObject
+
+          @Entity(tableName = "subjects")
+          data class SubjectEntity(
+              @PrimaryKey(autoGenerate = true) val id: Long = 0,
+              val name: String,
+              val active: Boolean = false,
+              val dailyMin: Int = 60,
+              val period: String = "AUTO",
+              val priority: Int = 2,
+              val createdAt: Long = System.currentTimeMillis()
+          )
+
+          @Entity(
+              tableName = "topics",
+              foreignKeys = [ForeignKey(SubjectEntity::class, ["id"], ["subjectId"], onDelete = ForeignKey.CASCADE)],
+              indices = [Index("subjectId")]
+          )
+          data class TopicEntity(
+              @PrimaryKey(autoGenerate = true) val id: Long = 0,
+              val subjectId: Long,
+              val title: String,
+              val difficulty: Int = 2,
+              val orderIndex: Int = 0,
+              val status: String = "NEW",
+              val understanding: Int = -1,
+              val learnedDay: Long = -1,
+              val createdAt: Long = System.currentTimeMillis()
+          )
+
+          @Entity(
+              tableName = "tasks",
+              foreignKeys = [ForeignKey(TopicEntity::class, ["id"], ["topicId"], onDelete = ForeignKey.CASCADE)],
+              indices = [Index(value = ["topicId", "day", "type"], unique = true), Index("day")]
+          )
+          data class DailyTaskEntity(
+              @PrimaryKey(autoGenerate = true) val id: Long = 0,
+              val topicId: Long,
+              val day: Long,
+              val period: String,
+              val type: String,
+              val plannedMin: Int,
+              val spentSec: Int = 0,
+              val status: String = "PENDING",
+              val revisionId: Long? = null,
+              val createdAt: Long = System.currentTimeMillis()
+          )
+
+          @Entity(
+              tableName = "revisions",
+              foreignKeys = [ForeignKey(TopicEntity::class, ["id"], ["topicId"], onDelete = ForeignKey.CASCADE)],
+              indices = [Index("topicId"), Index("dueDay")]
+          )
+          data class RevisionScheduleEntity(
+              @PrimaryKey(autoGenerate = true) val id: Long = 0,
+              val topicId: Long,
+              val dueDay: Long,
+              val stage: Int,
+              val done: Boolean = false,
+              val doneDay: Long = -1
+          )
+
+          @Entity(tableName = "sessions", indices = [Index("startedAt")])
+          data class StudySessionEntity(
+              @PrimaryKey(autoGenerate = true) val id: Long = 0,
+              val taskId: Long?,
+              val topicId: Long?,
+              val startedAt: Long,
+              val plannedSec: Int,
+              val spentSec: Int,
+              val completed: Boolean,
+              val isBreak: Boolean
+          )
+
+          @Entity(tableName = "history", indices = [Index("day")])
+          data class RevisionHistoryEntity(
+              @PrimaryKey(autoGenerate = true) val id: Long = 0,
+              val topicId: Long,
+              val day: Long,
+              val stage: Int,
+              val understanding: Int,
+              val kind: String
+          )
+
+          @Entity(tableName = "undo")
+          data class UndoEntity(
+              @PrimaryKey(autoGenerate = true) val id: Long = 0,
+              val label: String,
+              val payload: String,
+              val hist: Boolean,
+              val createdAt: Long = System.currentTimeMillis()
+          )
+
+          fun JSONArray.objs(): List<JSONObject> = (0 until length()).map { getJSONObject(it) }
+          private fun JSONObject.longOrNull(k: String): Long? = if (isNull(k)) null else getLong(k)
+
+          fun SubjectEntity.toJson(): JSONObject = JSONObject().put("id", id).put("name", name).put("active", active)
+              .put("dailyMin", dailyMin).put("period", period).put("priority", priority).put("createdAt", createdAt)
+          fun JSONObject.toSubject() = SubjectEntity(getLong("id"), getString("name"), getBoolean("active"), getInt("dailyMin"),
+              getString("period"), getInt("priority"), getLong("createdAt"))
+
+          fun TopicEntity.toJson(): JSONObject = JSONObject().put("id", id).put("subjectId", subjectId).put("title", title)
+              .put("difficulty", difficulty).put("orderIndex", orderIndex).put("status", status)
+              .put("understanding", understanding).put("learnedDay", learnedDay).put("createdAt", createdAt)
+          fun JSONObject.toTopic() = TopicEntity(getLong("id"), getLong("subjectId"), getString("title"), getInt("difficulty"),
+              getInt("orderIndex"), getString("status"), getInt("understanding"), getLong("learnedDay"), getLong("createdAt"))
+
+          fun DailyTaskEntity.toJson(): JSONObject = JSONObject().put("id", id).put("topicId", topicId).put("day", day)
+              .put("period", period).put("type", type).put("plannedMin", plannedMin).put("spentSec", spentSec)
+              .put("status", status).put("revisionId", revisionId ?: JSONObject.NULL).put("createdAt", createdAt)
+          fun JSONObject.toTask() = DailyTaskEntity(getLong("id"), getLong("topicId"), getLong("day"), getString("period"),
+              getString("type"), getInt("plannedMin"), getInt("spentSec"), getString("status"), longOrNull("revisionId"), getLong("createdAt"))
+
+          fun RevisionScheduleEntity.toJson(): JSONObject = JSONObject().put("id", id).put("topicId", topicId)
+              .put("dueDay", dueDay).put("stage", stage).put("done", done).put("doneDay", doneDay)
+          fun JSONObject.toRevision() = RevisionScheduleEntity(getLong("id"), getLong("topicId"), getLong("dueDay"),
+              getInt("stage"), getBoolean("done"), getLong("doneDay"))
+
+          fun StudySessionEntity.toJson(): JSONObject = JSONObject().put("id", id).put("taskId", taskId ?: JSONObject.NULL)
+              .put("topicId", topicId ?: JSONObject.NULL).put("startedAt", startedAt).put("plannedSec", plannedSec)
+              .put("spentSec", spentSec).put("completed", completed).put("isBreak", isBreak)
+          fun JSONObject.toSession() = StudySessionEntity(getLong("id"), longOrNull("taskId"), longOrNull("topicId"),
+              getLong("startedAt"), getInt("plannedSec"), getInt("spentSec"), getBoolean("completed"), getBoolean("isBreak"))
+
+          fun RevisionHistoryEntity.toJson(): JSONObject = JSONObject().put("id", id).put("topicId", topicId).put("day", day)
+              .put("stage", stage).put("understanding", understanding).put("kind", kind)
+          fun JSONObject.toHistory() = RevisionHistoryEntity(getLong("id"), getLong("topicId"), getLong("day"),
+              getInt("stage"), getInt("understanding"), getString("kind"))
+          EOF_06
+          mkdir -p "app/src/main/java/com/ragib/studyos/data"
+          cat > "app/src/main/java/com/ragib/studyos/data/Prefs.kt" <<'EOF_07'
+          package com.ragib.studyos.data
+
+          import android.content.Context
+          import androidx.datastore.preferences.core.*
+          import androidx.datastore.preferences.preferencesDataStore
+          import dagger.hilt.android.qualifiers.ApplicationContext
+          import kotlinx.coroutines.flow.Flow
+          import kotlinx.coroutines.flow.first
+          import kotlinx.coroutines.flow.map
+          import org.json.JSONObject
+          import javax.inject.Inject
+          import javax.inject.Singleton
+
+          data class Prefs(
+              val morningStart: Int = 360, val eveningStart: Int = 1020, val nightStart: Int = 1260,
+              val morningBudget: Int = 120, val eveningBudget: Int = 90, val nightBudget: Int = 40,
+              val sessionMin: Int = 45, val breakMin: Int = 5,
+              val intervals: List<Int> = listOf(1, 3, 5, 7), val revisionMin: Int = 10,
+              val friday: Boolean = true, val maxTasks: Int = 10, val dailyLimit: Int = 300,
+              val sound: String = "DEFAULT", val vibration: String = "NORMAL", val accent: Int = 0, val auto: Boolean = true
+          )
+
+          fun Prefs.toJson(): JSONObject = JSONObject().put("morningStart", morningStart).put("eveningStart", eveningStart)
+              .put("nightStart", nightStart).put("morningBudget", morningBudget).put("eveningBudget", eveningBudget)
+              .put("nightBudget", nightBudget).put("sessionMin", sessionMin).put("breakMin", breakMin)
+              .put("intervals", intervals.joinToString(",")).put("revisionMin", revisionMin).put("friday", friday)
+              .put("maxTasks", maxTasks).put("dailyLimit", dailyLimit).put("sound", sound).put("vibration", vibration)
+              .put("accent", accent).put("auto", auto)
+
+          fun JSONObject.toPrefs(): Prefs {
+              val d = Prefs()
+              return Prefs(
+                  optInt("morningStart", d.morningStart), optInt("eveningStart", d.eveningStart), optInt("nightStart", d.nightStart),
+                  optInt("morningBudget", d.morningBudget), optInt("eveningBudget", d.eveningBudget), optInt("nightBudget", d.nightBudget),
+                  optInt("sessionMin", d.sessionMin), optInt("breakMin", d.breakMin),
+                  optString("intervals", "1,3,5,7").split(",").mapNotNull { it.trim().toIntOrNull() }.ifEmpty { d.intervals },
+                  optInt("revisionMin", d.revisionMin), optBoolean("friday", d.friday), optInt("maxTasks", d.maxTasks),
+                  optInt("dailyLimit", d.dailyLimit), optString("sound", d.sound), optString("vibration", d.vibration),
+                  optInt("accent", d.accent), optBoolean("auto", d.auto)
+              )
+          }
+
+          private val Context.store by preferencesDataStore("studyos_prefs")
+
+          @Singleton
+          class PrefsRepository @Inject constructor(@ApplicationContext private val ctx: Context) {
+              private val blob = stringPreferencesKey("json")
+
+              val flow: Flow<Prefs> = ctx.store.data.map { p ->
+                  p[blob]?.let { runCatching { JSONObject(it).toPrefs() }.getOrNull() } ?: Prefs()
+              }
+
+              suspend fun get(): Prefs = flow.first()
+
+              suspend fun update(f: (Prefs) -> Prefs) {
+                  val n = f(get())
+                  ctx.store.edit { it[blob] = n.toJson().toString() }
+              }
+          }
+          EOF_07
+          mkdir -p "app/src/main/java/com/ragib/studyos/domain"
+          cat > "app/src/main/java/com/ragib/studyos/domain/Domain.kt" <<'EOF_08'
+          package com.ragib.studyos.domain
+
+          import com.ragib.studyos.data.Prefs
+          import java.time.LocalDate
+          import java.time.LocalTime
+
+          object Period {
+              const val MORNING = "MORNING"; const val EVENING = "EVENING"; const val NIGHT = "NIGHT"
+              val all = listOf(MORNING, EVENING, NIGHT)
+          }
+          object TType { const val LEARN = "LEARN"; const val PRACTICE = "PRACTICE"; const val REVISE = "REVISE"; const val WEEKLY = "WEEKLY" }
+          object TStatus {
+              const val PENDING = "PENDING"; const val DONE = "DONE"; const val INCOMPLETE = "INCOMPLETE"
+              const val RESCHEDULED = "RESCHEDULED"; const val MOVED = "MOVED"
+          }
+          object TopicStatus { const val NEW = "NEW"; const val SCHEDULED = "SCHEDULED"; const val LEARNED = "LEARNED" }
+          object U { const val NEED_MORE = 0; const val DIFFICULT = 1; const val PARTIAL = 2; const val FULL = 3 }
+
+          fun today(): Long = LocalDate.now().toEpochDay()
+
+          fun duration(diff: Int, p: Prefs): Int = when (diff) {
+              3 -> p.sessionMin
+              2 -> maxOf(15, p.sessionMin * 2 / 3)
+              else -> maxOf(10, p.sessionMin / 2)
+          }
+          fun budget(p: Prefs, per: String): Int = when (per) {
+              Period.MORNING -> p.morningBudget; Period.EVENING -> p.eveningBudget; else -> p.nightBudget
+          }
+          fun startOf(p: Prefs, per: String): Int = when (per) {
+              Period.MORNING -> p.morningStart; Period.EVENING -> p.eveningStart; else -> p.nightStart
+          }
+          fun currentPeriod(p: Prefs): String {
+              val n = LocalTime.now(); val m = n.hour * 60 + n.minute
+              return when {
+                  m >= p.morningStart && m < p.eveningStart -> Period.MORNING
+                  m >= p.eveningStart && m < p.nightStart -> Period.EVENING
+                  else -> Period.NIGHT
+              }
+          }
+          fun periodArgb(p: String): Int = when (p) { Period.MORNING -> 0xFFB44CFF; Period.EVENING -> 0xFF00E5FF; else -> 0xFF3D7BFF }.toInt()
+          EOF_08
+          mkdir -p "app/src/main/java/com/ragib/studyos/domain"
+          cat > "app/src/main/java/com/ragib/studyos/domain/Scheduler.kt" <<'EOF_09'
+          package com.ragib.studyos.domain
+
+          import androidx.room.withTransaction
+          import com.ragib.studyos.data.*
+          import java.time.DayOfWeek
+          import java.time.LocalDate
+          import javax.inject.Inject
+          import javax.inject.Singleton
+
+          @Singleton
+          class Scheduler @Inject constructor(private val db: AppDb, private val dao: StudyDao, private val prefs: PrefsRepository) {
+
+              /** Idempotent: safe to call any number of times for the same day. */
+              suspend fun generate(day: Long) {
+                  val p = prefs.get()
+                  db.withTransaction {
+                      dao.stalePending(day).forEach { dao.updateTask(it.copy(status = TStatus.INCOMPLETE)) }
+                      if (!p.auto) return@withTransaction
+                      val topics = dao.topicsNow().associateBy { it.id }
+                      val subjects = dao.subjectsNow()
+                      val tasks = dao.tasksForDayNow(day)
+                          .filter { it.status == TStatus.PENDING || it.status == TStatus.DONE }.toMutableList()
+                      var count = tasks.size
+                      var minutes = tasks.sumOf { it.plannedMin }
+
+                      suspend fun add(t: DailyTaskEntity): Boolean {
+                          val empty = tasks.none { it.period == t.period }
+                          val room = budget(p, t.period) - tasks.filter { it.period == t.period }.sumOf { it.plannedMin }
+                          if (count >= p.maxTasks || minutes + t.plannedMin > p.dailyLimit) return false
+                          if (!empty && room < t.plannedMin) return false
+                          val id = dao.insertTask(t)
+                          if (id < 0) return false
+                          tasks.add(t.copy(id = id)); count++; minutes += t.plannedMin
+                          return true
+                      }
+
+                      dao.incompleteNow().filter { it.day < day }.sortedBy { it.day }.forEach { old ->
+                          if (topics[old.topicId] == null) return@forEach
+                          val dup = tasks.any { it.topicId == old.topicId && it.type == old.type }
+                          val ok = !dup && add(old.copy(id = 0, day = day, spentSec = 0, status = TStatus.PENDING, createdAt = System.currentTimeMillis()))
+                          if (ok || dup) dao.updateTask(old.copy(status = TStatus.MOVED))
+                      }
+
+                      val isFriday = LocalDate.ofEpochDay(day).dayOfWeek == DayOfWeek.FRIDAY
+                      val weekly: Set<Long> = if (p.friday && isFriday)
+                          topics.values.filter { it.status == TopicStatus.LEARNED && it.learnedDay in (day - 6)..(day - 1) }.map { it.id }.toSet()
+                      else emptySet()
+
+                      dao.dueRevisions(day).sortedBy { it.dueDay }.forEach { r ->
+                          if (topics[r.topicId] == null || r.topicId in weekly) return@forEach
+                          add(DailyTaskEntity(topicId = r.topicId, day = day, period = Period.NIGHT, type = TType.REVISE,
+                              plannedMin = p.revisionMin, revisionId = r.id))
+                      }
+                      weekly.forEach { tid ->
+                          val open = dao.revisionsOfTopic(tid).firstOrNull { !it.done && it.dueDay <= day }
+                          add(DailyTaskEntity(topicId = tid, day = day, period = Period.NIGHT, type = TType.WEEKLY,
+                              plannedMin = p.revisionMin, revisionId = open?.id))
+                      }
+
+                      for (s in subjects.filter { it.active }.sortedByDescending { it.priority }) {
+                          var left = s.dailyMin - tasks.filter {
+                              (it.type == TType.LEARN || it.type == TType.PRACTICE) && topics[it.topicId]?.subjectId == s.id
+                          }.sumOf { it.plannedMin }
+                          val queue = topics.values.filter { it.subjectId == s.id && it.status == TopicStatus.NEW }.sortedBy { it.orderIndex }
+                          for (t in queue) {
+                              val min = minOf(duration(t.difficulty, p), s.dailyMin)
+                              if (left < min) break
+                              val first = when {
+                                  s.period == Period.MORNING || s.period == Period.EVENING -> s.period
+                                  t.difficulty >= 3 -> Period.MORNING
+                                  else -> Period.EVENING
+                              }
+                              val order = listOf(first, if (first == Period.MORNING) Period.EVENING else Period.MORNING)
+                              var placed = false
+                              for (per in order) {
+                                  val type = if (per == Period.MORNING) TType.LEARN else TType.PRACTICE
+                                  if (add(DailyTaskEntity(topicId = t.id, day = day, period = per, type = type, plannedMin = min))) { placed = true; break }
+                              }
+                              if (!placed) break
+                              dao.updateTopic(t.copy(status = TopicStatus.SCHEDULED)); left -= min
+                          }
+                      }
+                  }
+              }
+          }
+          EOF_09
+          mkdir -p "app/src/main/java/com/ragib/studyos/domain"
+          cat > "app/src/main/java/com/ragib/studyos/domain/StudyRepository.kt" <<'EOF_10'
+          package com.ragib.studyos.domain
+
+          import androidx.room.withTransaction
+          import com.ragib.studyos.data.*
+          import org.json.JSONArray
+          import org.json.JSONObject
+          import javax.inject.Inject
+          import javax.inject.Singleton
+          import kotlin.math.ceil
+
+          @Singleton
+          class StudyRepository @Inject constructor(
+              private val db: AppDb, private val dao: StudyDao, private val prefs: PrefsRepository
+          ) {
+              fun subjects() = dao.subjects()
+              fun topics() = dao.topics()
+              fun tasksForDay(d: Long) = dao.tasksForDay(d)
+              fun allTasks() = dao.allTasks()
+              fun sessions() = dao.sessions()
+              fun history() = dao.history()
+              fun undoCount() = dao.undoCount()
+              suspend fun tasksNow(day: Long) = dao.tasksForDayNow(day)
+              suspend fun topicTitle(id: Long) = dao.topic(id)?.title ?: ""
+
+              // ---------- subjects / topics ----------
+              suspend fun addSubject(name: String, topics: List<Pair<String, Int>>): Long = db.withTransaction {
+                  val id = dao.insertSubject(SubjectEntity(name = name.trim()))
+                  insertTopics(id, topics); id
+              }
+              suspend fun addTopics(subjectId: Long, topics: List<Pair<String, Int>>): Unit = db.withTransaction { insertTopics(subjectId, topics) }
+              private suspend fun insertTopics(sid: Long, list: List<Pair<String, Int>>) {
+                  var o = dao.maxOrder(sid)
+                  dao.insertTopics(list.map { (t, d) -> o++; TopicEntity(subjectId = sid, title = t, difficulty = d, orderIndex = o) })
+              }
+              suspend fun updateSubject(s: SubjectEntity) = dao.updateSubject(s)
+              suspend fun deleteSubject(s: SubjectEntity) = dao.deleteSubject(s)
+              suspend fun updateTopic(t: TopicEntity) = dao.updateTopic(t)
+              suspend fun deleteTopic(t: TopicEntity): Unit = db.withTransaction {
+                  pushUndo("Deleted \"${t.title}\"", listOf(t.id), false); dao.deleteTopic(t)
+              }
+
+              suspend fun addToToday(topicId: Long): Unit = db.withTransaction {
+                  val t = dao.topic(topicId) ?: return@withTransaction
+                  val p = prefs.get()
+                  pushUndo("Added \"${t.title}\" to today", listOf(t.id), false)
+                  val learned = t.status == TopicStatus.LEARNED
+                  val per = if (learned) Period.NIGHT else if (t.difficulty >= 3) Period.MORNING else Period.EVENING
+                  val type = if (learned) TType.REVISE else if (per == Period.MORNING) TType.LEARN else TType.PRACTICE
+                  val rev = if (learned) dao.revisionsOfTopic(t.id).firstOrNull { !it.done } else null
+                  dao.insertTask(DailyTaskEntity(topicId = t.id, day = today(), period = per, type = type,
+                      plannedMin = if (learned) p.revisionMin else duration(t.difficulty, p), revisionId = rev?.id))
+                  if (t.status == TopicStatus.NEW) dao.updateTopic(t.copy(status = TopicStatus.SCHEDULED))
+              }
+
+              suspend fun scheduleExtra(topicId: Long, toDay: Long): Unit = db.withTransaction {
+                  val t = dao.topic(topicId) ?: return@withTransaction
+                  val p = prefs.get()
+                  pushUndo("Extra session for \"${t.title}\"", listOf(t.id), false)
+                  val per = if (t.difficulty >= 3) Period.MORNING else Period.EVENING
+                  dao.insertTask(DailyTaskEntity(topicId = t.id, day = toDay, period = per,
+                      type = if (per == Period.MORNING) TType.LEARN else TType.PRACTICE, plannedMin = duration(t.difficulty, p)))
+                  if (t.status == TopicStatus.NEW) dao.updateTopic(t.copy(status = TopicStatus.SCHEDULED))
+              }
+
+              // ---------- completion + spaced repetition ----------
+              private fun gap(base: Int, u: Int): Int = when (u) {
+                  U.FULL -> ceil(base * 1.5).toInt()
+                  U.DIFFICULT -> maxOf(1, base / 2)
+                  else -> base
+              }
+
+              suspend fun completeTask(taskId: Long, u: Int): Unit = db.withTransaction {
+                  val t = dao.task(taskId) ?: return@withTransaction
+                  if (t.status == TStatus.DONE) return@withTransaction
+                  val topic = dao.topic(t.topicId) ?: return@withTransaction
+                  pushUndo("Completed \"${topic.title}\"", listOf(topic.id), true)
+                  val p = prefs.get(); val today = today()
+                  var stage = 0
+                  dao.updateTask(t.copy(status = TStatus.DONE))
+                  when (t.type) {
+                      TType.LEARN, TType.PRACTICE -> {
+                          if (topic.status == TopicStatus.LEARNED) {
+                              dao.updateTopic(topic.copy(understanding = u))
+                          } else if (u == U.NEED_MORE) {
+                              dao.updateTopic(topic.copy(understanding = u))
+                              dao.insertTask(t.copy(id = 0, day = today + 1, spentSec = 0, status = TStatus.PENDING, createdAt = System.currentTimeMillis()))
+                          } else {
+                              dao.updateTopic(topic.copy(status = TopicStatus.LEARNED, understanding = u, learnedDay = today))
+                              dao.revisionsOfTopic(topic.id).filter { !it.done }.forEach { dao.putRevision(it.copy(done = true, doneDay = today)) }
+                              stage = 1
+                              dao.putRevision(RevisionScheduleEntity(topicId = topic.id, dueDay = today + gap(p.intervals.first(), u), stage = 1))
+                          }
+                      }
+                      else -> {
+                          val rev = t.revisionId?.let { dao.revision(it) } ?: dao.revisionsOfTopic(topic.id).firstOrNull { !it.done }
+                          dao.updateTopic(topic.copy(understanding = u))
+                          if (rev != null && !rev.done) {
+                              stage = rev.stage
+                              dao.putRevision(rev.copy(done = true, doneDay = today))
+                              fun interval(s: Int) = p.intervals.getOrElse(s - 1) { p.intervals.last() }
+                              val next = when (u) {
+                                  U.FULL, U.PARTIAL -> rev.stage + 1
+                                  else -> rev.stage
+                              }
+                              val g = when (u) {
+                                  U.FULL -> gap(interval(next), U.FULL)
+                                  U.PARTIAL -> interval(next)
+                                  U.DIFFICULT -> gap(interval(next), U.DIFFICULT)
+                                  else -> 1
+                              }
+                              val finished = u >= U.PARTIAL && next > p.intervals.size
+                              if (!finished) dao.putRevision(RevisionScheduleEntity(topicId = topic.id, dueDay = today + g, stage = next))
+                          }
+                      }
+                  }
+                  dao.insertHistory(RevisionHistoryEntity(topicId = topic.id, day = today, stage = stage, understanding = u, kind = t.type))
+                  Unit
+              }
+
+              // ---------- incomplete / reschedule / overwhelmed ----------
+              private suspend fun moveTask(t: DailyTaskEntity, toDay: Long, status: String) {
+                  if (toDay == t.day) return
+                  dao.updateTask(t.copy(status = status))
+                  dao.insertTask(t.copy(id = 0, day = toDay, status = TStatus.PENDING, spentSec = 0, createdAt = System.currentTimeMillis()))
+                  t.revisionId?.let { id -> dao.revision(id)?.let { dao.putRevision(it.copy(dueDay = toDay)) } }
+              }
+
+              suspend fun markIncomplete(taskId: Long, toDay: Long?): Unit = db.withTransaction {
+                  val t = dao.task(taskId) ?: return@withTransaction
+                  pushUndo("Marked incomplete", listOf(t.topicId), false)
+                  dao.updateTask(t.copy(status = TStatus.INCOMPLETE))
+                  if (toDay != null) moveTask(t.copy(status = TStatus.INCOMPLETE), toDay, TStatus.MOVED)
+              }
+
+              suspend fun reschedule(taskId: Long, toDay: Long): Unit = db.withTransaction {
+                  val t = dao.task(taskId) ?: return@withTransaction
+                  pushUndo("Rescheduled", listOf(t.topicId), false)
+                  moveTask(t, toDay, TStatus.RESCHEDULED)
+              }
+
+              suspend fun overwhelmed(day: Long): Int = db.withTransaction {
+                  val pending = dao.tasksForDayNow(day).filter { it.status == TStatus.PENDING }
+                  if (pending.size <= 1) return@withTransaction 0
+                  fun prio(t: DailyTaskEntity) = when (t.type) { TType.REVISE -> 3; TType.LEARN, TType.WEEKLY -> 2; else -> 1 }
+                  val sorted = pending.sortedWith(compareByDescending<DailyTaskEntity> { prio(it) }.thenBy { it.plannedMin })
+                  val total = pending.sumOf { it.plannedMin }
+                  var kept = 0
+                  val keep = mutableSetOf<Long>()
+                  for (t in sorted) if (keep.isEmpty() || kept + t.plannedMin <= total / 2) { keep.add(t.id); kept += t.plannedMin }
+                  val move = pending.filter { it.id !in keep }
+                  if (move.isEmpty()) return@withTransaction 0
+                  pushUndo("I'm overwhelmed", move.map { it.topicId }, false)
+                  move.forEach { moveTask(it, day + 1, TStatus.RESCHEDULED) }
+                  move.size
+              }
+
+              suspend fun recordSession(taskId: Long?, topicId: Long?, plannedSec: Int, spentSec: Int, completed: Boolean, isBreak: Boolean): Unit =
+                  db.withTransaction {
+                      dao.insertSession(StudySessionEntity(taskId = taskId, topicId = topicId,
+                          startedAt = System.currentTimeMillis() - spentSec * 1000L, plannedSec = plannedSec,
+                          spentSec = spentSec, completed = completed, isBreak = isBreak))
+                      if (!isBreak && taskId != null && spentSec > 0) dao.task(taskId)?.let { dao.updateTask(it.copy(spentSec = it.spentSec + spentSec)) }
+                  }
+
+              // ---------- undo ----------
+              private suspend fun pushUndo(label: String, topicIds: List<Long>, hist: Boolean) {
+                  val arr = JSONArray()
+                  topicIds.distinct().forEach { id ->
+                      val tp = dao.topic(id) ?: return@forEach
+                      arr.put(JSONObject().put("topic", tp.toJson())
+                          .put("tasks", JSONArray(dao.tasksOfTopic(id).map { it.toJson() }))
+                          .put("revs", JSONArray(dao.revisionsOfTopic(id).map { it.toJson() })))
+                  }
+                  dao.insertUndo(UndoEntity(label = label, payload = arr.toString(), hist = hist))
+                  dao.trimUndo()
+              }
+
+              suspend fun undoLast(): String? = db.withTransaction {
+                  val u = dao.lastUndo() ?: return@withTransaction null
+                  JSONArray(u.payload).objs().forEach { o ->
+                      val topic = o.getJSONObject("topic").toTopic()
+                      dao.putTopics(listOf(topic))
+                      dao.deleteTasksOfTopic(topic.id); dao.deleteRevisionsOfTopic(topic.id)
+                      dao.putTasks(o.getJSONArray("tasks").objs().map { it.toTask() })
+                      dao.putRevisions(o.getJSONArray("revs").objs().map { it.toRevision() })
+                      if (u.hist) dao.deleteLastHistory(topic.id)
+                  }
+                  dao.deleteUndo(u)
+                  u.label
+              }
+
+              // ---------- backup ----------
+              suspend fun exportJson(): String = JSONObject().put("app", "studyos").put("version", 1)
+                  .put("exportedAt", System.currentTimeMillis())
+                  .put("subjects", JSONArray(dao.subjectsNow().map { it.toJson() }))
+                  .put("topics", JSONArray(dao.topicsNow().map { it.toJson() }))
+                  .put("tasks", JSONArray(dao.tasksNow().map { it.toJson() }))
+                  .put("revisions", JSONArray(dao.revisionsNow().map { it.toJson() }))
+                  .put("sessions", JSONArray(dao.sessionsNow().map { it.toJson() }))
+                  .put("history", JSONArray(dao.historyNow().map { it.toJson() }))
+                  .put("prefs", prefs.get().toJson()).toString(2)
+
+              suspend fun importJson(s: String) {
+                  val o = JSONObject(s)
+                  require(o.optString("app") == "studyos") { "Not a StudyOS backup" }
+                  val subjects = o.getJSONArray("subjects").objs().map { it.toSubject() }
+                  val topics = o.getJSONArray("topics").objs().map { it.toTopic() }
+                  val tasks = o.getJSONArray("tasks").objs().map { it.toTask() }
+                  val revs = o.getJSONArray("revisions").objs().map { it.toRevision() }
+                  val sessions = o.getJSONArray("sessions").objs().map { it.toSession() }
+                  val hist = o.getJSONArray("history").objs().map { it.toHistory() }
+                  val pf = o.getJSONObject("prefs").toPrefs()
+                  db.withTransaction {
+                      dao.clearSessions(); dao.clearHistory(); dao.clearUndo(); dao.clearTasks()
+                      dao.clearRevisions(); dao.clearTopics(); dao.clearSubjects()
+                      dao.putSubjects(subjects); dao.putTopics(topics); dao.putTasks(tasks)
+                      dao.putRevisions(revs); dao.putSessions(sessions); dao.putHistory(hist)
+                  }
+                  prefs.update { pf }
+              }
+          }
+          EOF_10
+          mkdir -p "app/src/main/java/com/ragib/studyos/system"
+          cat > "app/src/main/java/com/ragib/studyos/system/Alarms.kt" <<'EOF_11'
+          package com.ragib.studyos.system
+
+          import android.annotation.SuppressLint
+          import android.app.AlarmManager
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.app.PendingIntent
+          import android.content.BroadcastReceiver
+          import android.content.Context
+          import android.content.Intent
+          import android.media.AudioAttributes
+          import android.media.RingtoneManager
+          import android.os.Build
+          import androidx.core.app.NotificationCompat
+          import androidx.core.app.NotificationManagerCompat
+          import androidx.work.CoroutineWorker
+          import androidx.work.WorkerParameters
+          import com.ragib.studyos.MainActivity
+          import com.ragib.studyos.data.PrefsRepository
+          import com.ragib.studyos.domain.*
+          import dagger.hilt.EntryPoint
+          import dagger.hilt.InstallIn
+          import dagger.hilt.android.EntryPointAccessors
+          import dagger.hilt.android.qualifiers.ApplicationContext
+          import dagger.hilt.components.SingletonComponent
+          import kotlinx.coroutines.CoroutineScope
+          import kotlinx.coroutines.Dispatchers
+          import kotlinx.coroutines.launch
+          import java.time.LocalDate
+          import java.time.LocalDateTime
+          import java.time.ZoneId
+          import javax.inject.Inject
+          import javax.inject.Singleton
+
+          object Actions {
+              const val FIRE = "com.ragib.studyos.FIRE"
+              const val SNOOZE = "com.ragib.studyos.SNOOZE"
+              const val DISMISS = "com.ragib.studyos.DISMISS"
+          }
+
+          @Singleton
+          class AlarmScheduler @Inject constructor(@ApplicationContext private val ctx: Context, private val prefs: PrefsRepository) {
+              private val am = ctx.getSystemService(AlarmManager::class.java)
+
+              private fun pi(req: Int, period: String): PendingIntent = PendingIntent.getBroadcast(
+                  ctx, req, Intent(ctx, AlarmReceiver::class.java).setAction(Actions.FIRE).putExtra("period", period).putExtra("nid", 200 + Period.all.indexOf(period)),
+                  PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+              )
+
+              private fun set(at: Long, pi: PendingIntent) {
+                  if (Build.VERSION.SDK_INT >= 31 && !am.canScheduleExactAlarms()) am.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, at, pi)
+                  else am.setExactAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, at, pi)
+              }
+
+              suspend fun scheduleAll() {
+                  val p = prefs.get()
+                  Period.all.forEachIndexed { idx, per ->
+                      val m = startOf(p, per)
+                      var t = LocalDate.now().atTime(m / 60, m % 60)
+                      if (!t.isAfter(LocalDateTime.now().plusSeconds(30))) t = t.plusDays(1)
+                      set(t.atZone(ZoneId.systemDefault()).toInstant().toEpochMilli(), pi(idx, per))
+                  }
+              }
+
+              fun snooze(period: String, minutes: Int) {
+                  set(System.currentTimeMillis() + minutes * 60_000L, pi(50 + Period.all.indexOf(period), period))
+              }
+          }
+
+          @Singleton
+          class Notifier @Inject constructor(@ApplicationContext private val ctx: Context, private val prefs: PrefsRepository) {
+              private suspend fun channel(): String {
+                  val p = prefs.get()
+                  val id = "study_${p.sound}_${p.vibration}"
+                  val nm = ctx.getSystemService(NotificationManager::class.java)
+                  if (nm.getNotificationChannel(id) == null) {
+                      val ch = NotificationChannel(id, "Study reminders (${p.sound.lowercase()} / ${p.vibration.lowercase()})", NotificationManager.IMPORTANCE_HIGH)
+                      when (p.sound) {
+                          "SILENT" -> ch.setSound(null, null)
+                          "ALARM" -> ch.setSound(RingtoneManager.getDefaultUri(RingtoneManager.TYPE_ALARM),
+                              AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_ALARM).setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION).build())
+                          else -> ch.setSound(RingtoneManager.getDefaultUri(RingtoneManager.TYPE_NOTIFICATION),
+                              AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_NOTIFICATION).build())
+                      }
+                      val pat = when (p.vibration) {
+                          "OFF" -> null
+                          "LIGHT" -> longArrayOf(0, 120)
+                          "STRONG" -> longArrayOf(0, 500, 200, 500, 200, 500)
+                          else -> longArrayOf(0, 250, 150, 250)
+                      }
+                      if (pat == null) ch.enableVibration(false) else { ch.enableVibration(true); ch.vibrationPattern = pat }
+                      nm.createNotificationChannel(ch)
+                  }
+                  return id
+              }
+
+              @SuppressLint("MissingPermission")
+              suspend fun post(id: Int, title: String, text: String, period: String?, actions: Boolean) {
+                  val nmc = NotificationManagerCompat.from(ctx)
+                  if (!nmc.areNotificationsEnabled()) return
+                  val open = PendingIntent.getActivity(ctx, 0,
+                      Intent(ctx, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP),
+                      PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
+                  val b = NotificationCompat.Builder(ctx, channel())
+                      .setSmallIcon(android.R.drawable.ic_popup_reminder)
+                      .setContentTitle(title).setContentText(text)
+                      .setStyle(NotificationCompat.BigTextStyle().bigText(text))
+                      .setColor(periodArgb(period ?: Period.MORNING))
+                      .setAutoCancel(true).setPriority(NotificationCompat.PRIORITY_HIGH)
+                      .setCategory(NotificationCompat.CATEGORY_REMINDER).setContentIntent(open)
+                  if (actions) {
+                      fun bc(a: String, rc: Int) = PendingIntent.getBroadcast(ctx, rc,
+                          Intent(ctx, AlarmReceiver::class.java).setAction(a).putExtra("period", period ?: Period.MORNING).putExtra("nid", id),
+                          PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
+                      b.addAction(0, "Start Study", open)
+                      b.addAction(0, "Snooze", bc(Actions.SNOOZE, id + 1000))
+                      b.addAction(0, "Dismiss", bc(Actions.DISMISS, id + 2000))
+                  }
+                  try { nmc.notify(id, b.build()) } catch (_: SecurityException) {}
+              }
+          }
+
+          @EntryPoint
+          @InstallIn(SingletonComponent::class)
+          interface WorkEntry {
+              fun scheduler(): Scheduler
+              fun alarms(): AlarmScheduler
+              fun repo(): StudyRepository
+              fun notifier(): Notifier
+          }
+
+          class AlarmReceiver : BroadcastReceiver() {
+              override fun onReceive(context: Context, intent: Intent) {
+                  val e = EntryPointAccessors.fromApplication(context.applicationContext, WorkEntry::class.java)
+                  val pending = goAsync()
+                  val period = intent.getStringExtra("period") ?: Period.MORNING
+                  val nid = intent.getIntExtra("nid", 200)
+                  CoroutineScope(Dispatchers.IO).launch {
+                      try {
+                          when (intent.action) {
+                              Actions.FIRE -> {
+                                  val day = today()
+                                  e.scheduler().generate(day)
+                                  val tasks = e.repo().tasksNow(day).filter { it.period == period && it.status == TStatus.PENDING }
+                                  if (tasks.isNotEmpty()) {
+                                      val first = e.repo().topicTitle(tasks.first().topicId)
+                                      val msg: Pair<String, String> = when {
+                                          tasks.any { it.type == TType.WEEKLY } -> Pair("Weekly Friday revision", "${tasks.size} topic(s) from this week are ready. Start with $first.")
+                                          period == Period.NIGHT -> Pair("Night revision", "${tasks.size} quick revision(s) due. Start with $first.")
+                                          tasks.any { it.type == TType.REVISE } -> Pair("Scheduled revision", "${tasks.size} revision(s) due. Start with $first.")
+                                          else -> Pair("Study session starting", "${tasks.size} topic(s) planned. First: $first")
+                                      }
+                                      e.notifier().post(nid, msg.first, msg.second, period, true)
+                                  }
+                                  e.alarms().scheduleAll()
+                              }
+                              Actions.SNOOZE -> { NotificationManagerCompat.from(context).cancel(nid); e.alarms().snooze(period, 10) }
+                              Actions.DISMISS -> NotificationManagerCompat.from(context).cancel(nid)
+                          }
+                      } finally { pending.finish() }
+                  }
+              }
+          }
+
+          class BootReceiver : BroadcastReceiver() {
+              override fun onReceive(context: Context, intent: Intent) {
+                  val e = EntryPointAccessors.fromApplication(context.applicationContext, WorkEntry::class.java)
+                  val pending = goAsync()
+                  CoroutineScope(Dispatchers.IO).launch {
+                      try { e.scheduler().generate(today()); e.alarms().scheduleAll() } finally { pending.finish() }
+                  }
+              }
+          }
+
+          class PlanWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ctx, params) {
+              override suspend fun doWork(): Result {
+                  val e = EntryPointAccessors.fromApplication(applicationContext, WorkEntry::class.java)
+                  e.scheduler().generate(today())
+                  e.alarms().scheduleAll()
+                  return Result.success()
+              }
+          }
+          EOF_11
+          mkdir -p "app/src/main/java/com/ragib/studyos/system"
+          cat > "app/src/main/java/com/ragib/studyos/system/Timer.kt" <<'EOF_12'
+          package com.ragib.studyos.system
+
+          import android.app.*
+          import android.content.Context
+          import android.content.Intent
+          import android.content.pm.ServiceInfo
+          import android.os.Build
+          import android.os.IBinder
+          import android.os.SystemClock
+          import androidx.core.app.NotificationCompat
+          import androidx.core.app.ServiceCompat
+          import androidx.core.content.ContextCompat
+          import com.ragib.studyos.MainActivity
+          import com.ragib.studyos.domain.StudyRepository
+          import dagger.hilt.android.AndroidEntryPoint
+          import dagger.hilt.android.qualifiers.ApplicationContext
+          import kotlinx.coroutines.*
+          import kotlinx.coroutines.flow.MutableStateFlow
+          import javax.inject.Inject
+          import javax.inject.Singleton
+
+          data class TimerUi(
+              val state: String = "IDLE", // IDLE, RUNNING, PAUSED, FINISHED
+              val remainingSec: Int = 0, val totalSec: Int = 0, val isBreak: Boolean = false,
+              val taskId: Long? = null, val topicId: Long? = null, val title: String = "", val period: String = "MORNING"
+          )
+
+          const val A_START = "studyos.START"
+          const val A_PAUSE = "studyos.PAUSE"
+          const val A_RESUME = "studyos.RESUME"
+          const val A_STOP = "studyos.STOP"
+
+          @Singleton
+          class TimerController @Inject constructor(@ApplicationContext private val ctx: Context) {
+              val state = MutableStateFlow(TimerUi())
+
+              fun start(taskId: Long?, topicId: Long?, title: String, period: String, seconds: Int, isBreak: Boolean = false) {
+                  ContextCompat.startForegroundService(ctx, Intent(ctx, TimerService::class.java).setAction(A_START)
+                      .putExtra("task", taskId ?: -1L).putExtra("topic", topicId ?: -1L).putExtra("title", title)
+                      .putExtra("period", period).putExtra("sec", seconds).putExtra("break", isBreak))
+              }
+              private fun cmd(a: String) { ctx.startService(Intent(ctx, TimerService::class.java).setAction(a)) }
+              fun pause() = cmd(A_PAUSE)
+              fun resume() = cmd(A_RESUME)
+              fun stop() = cmd(A_STOP)
+              fun reset() { state.value = TimerUi() }
+          }
+
+          fun fmtTime(sec: Int): String = "%02d:%02d".format(sec / 60, sec % 60)
+
+          @AndroidEntryPoint
+          class TimerService : Service() {
+              @Inject lateinit var timer: TimerController
+              @Inject lateinit var repo: StudyRepository
+              @Inject lateinit var notifier: Notifier
+
+              private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+              private val io = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+              private var ticker: Job? = null
+              private var endAt = 0L
+              private var remainingMs = 0L
+
+              override fun onBind(intent: Intent?): IBinder? = null
+
+              override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+                  when (intent?.action) {
+                      A_START -> intent?.let { start(it) }
+                      A_PAUSE -> pause()
+                      A_RESUME -> resume()
+                      A_STOP -> stopSession()
+                      else -> if (timer.state.value.state == "IDLE") stopSelf()
+                  }
+                  return START_NOT_STICKY
+              }
+
+              override fun onDestroy() { scope.cancel(); super.onDestroy() }
+
+              private fun start(i: Intent) {
+                  val total = i.getIntExtra("sec", 60).coerceAtLeast(1)
+                  val s = TimerUi("RUNNING", total, total, i.getBooleanExtra("break", false),
+                      i.getLongExtra("task", -1L).takeIf { it >= 0 }, i.getLongExtra("topic", -1L).takeIf { it >= 0 },
+                      i.getStringExtra("title") ?: "", i.getStringExtra("period") ?: "MORNING")
+                  remainingMs = total * 1000L
+                  timer.state.value = s
+                  ServiceCompat.startForeground(this, 100, buildNotif(s), if (Build.VERSION.SDK_INT >= 34) ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE else 0)
+                  runTicker()
+              }
+
+              private fun runTicker() {
+                  ticker?.cancel()
+                  endAt = SystemClock.elapsedRealtime() + remainingMs
+                  ticker = scope.launch {
+                      while (isActive) {
+                          val rem = endAt - SystemClock.elapsedRealtime()
+                          if (rem <= 0) { finish(); break }
+                          timer.state.value = timer.state.value.copy(remainingSec = ((rem + 999) / 1000).toInt())
+                          delay(250)
+                      }
+                  }
+              }
+
+              private fun pause() {
+                  val s = timer.state.value
+                  if (s.state != "RUNNING") return
+                  ticker?.cancel()
+                  remainingMs = maxOf(0L, endAt - SystemClock.elapsedRealtime())
+                  val n = s.copy(state = "PAUSED", remainingSec = ((remainingMs + 999) / 1000).toInt())
+                  timer.state.value = n; refreshNotif(n)
+              }
+
+              private fun resume() {
+                  val s = timer.state.value
+                  if (s.state != "PAUSED") return
+                  val n = s.copy(state = "RUNNING"); timer.state.value = n
+                  runTicker(); refreshNotif(n)
+              }
+
+              private fun finish() {
+                  val s = timer.state.value
+                  timer.state.value = s.copy(state = "FINISHED", remainingSec = 0)
+                  io.launch {
+                      repo.recordSession(s.taskId, s.topicId, s.totalSec, s.totalSec, true, s.isBreak)
+                      notifier.post(101, if (s.isBreak) "Break over" else "Session complete",
+                          if (s.isBreak) "Time to get back to it." else "${s.title} — well done. Open the app to rate your understanding.", s.period, false)
+                  }
+                  stopForeground(STOP_FOREGROUND_REMOVE); stopSelf()
+              }
+
+              private fun stopSession() {
+                  val s = timer.state.value
+                  ticker?.cancel()
+                  val spent = s.totalSec - s.remainingSec
+                  if (s.state == "RUNNING" || s.state == "PAUSED") {
+                      if (spent >= 10) io.launch { repo.recordSession(s.taskId, s.topicId, s.totalSec, spent, false, s.isBreak) }
+                  }
+                  timer.state.value = TimerUi()
+                  stopForeground(STOP_FOREGROUND_REMOVE); stopSelf()
+              }
+
+              private fun svc(a: String, rc: Int) = PendingIntent.getService(this, rc, Intent(this, TimerService::class.java).setAction(a),
+                  PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
+
+              private fun refreshNotif(s: TimerUi) { getSystemService(NotificationManager::class.java).notify(100, buildNotif(s)) }
+
+              private fun buildNotif(s: TimerUi): Notification {
+                  val nm = getSystemService(NotificationManager::class.java)
+                  if (nm.getNotificationChannel("timer") == null)
+                      nm.createNotificationChannel(NotificationChannel("timer", "Study timer", NotificationManager.IMPORTANCE_LOW))
+                  val open = PendingIntent.getActivity(this, 0,
+                      Intent(this, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP),
+                      PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
+                  val b = NotificationCompat.Builder(this, "timer").setSmallIcon(android.R.drawable.ic_lock_idle_alarm)
+                      .setContentTitle(if (s.isBreak) "Break" else s.title.ifEmpty { "Study session" })
+                      .setContentIntent(open).setOngoing(true).setOnlyAlertOnce(true)
+                  if (s.state == "RUNNING") {
+                      b.setUsesChronometer(true).setChronometerCountDown(true).setShowWhen(true)
+                          .setWhen(System.currentTimeMillis() + s.remainingSec * 1000L).setContentText("Session running")
+                      b.addAction(0, "Pause", svc(A_PAUSE, 1))
+                  } else {
+                      b.setContentText("Paused · ${fmtTime(s.remainingSec)}")
+                      b.addAction(0, "Resume", svc(A_RESUME, 2))
+                  }
+                  b.addAction(0, "Stop", svc(A_STOP, 3))
+                  return b.build()
+              }
+          }
+          EOF_12
+          mkdir -p "app/src/main/java/com/ragib/studyos/ui"
+          cat > "app/src/main/java/com/ragib/studyos/ui/Components.kt" <<'EOF_13'
+          package com.ragib.studyos.ui
+
+          import androidx.compose.animation.core.Animatable
+          import androidx.compose.animation.core.animateFloatAsState
+          import androidx.compose.animation.core.tween
+          import androidx.compose.foundation.Canvas
+          import androidx.compose.foundation.background
+          import androidx.compose.foundation.border
+          import androidx.compose.foundation.clickable
+          import androidx.compose.foundation.horizontalScroll
+          import androidx.compose.foundation.layout.*
+          import androidx.compose.foundation.rememberScrollState
+          import androidx.compose.foundation.shape.RoundedCornerShape
+          import androidx.compose.material3.*
+          import androidx.compose.runtime.*
+          import androidx.compose.ui.Alignment
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.draw.clip
+          import androidx.compose.ui.graphics.Brush
+          import androidx.compose.ui.graphics.Color
+          import androidx.compose.ui.graphics.StrokeCap
+          import androidx.compose.ui.graphics.drawscope.Stroke
+          import androidx.compose.ui.hapticfeedback.HapticFeedbackType
+          import androidx.compose.ui.platform.LocalHapticFeedback
+          import androidx.compose.ui.text.font.FontWeight
+          import androidx.compose.ui.text.style.TextAlign
+          import androidx.compose.ui.unit.Dp
+          import androidx.compose.ui.unit.dp
+          import androidx.compose.ui.unit.sp
+          import com.ragib.studyos.domain.Period
+          import com.ragib.studyos.domain.TType
+          import java.time.Instant
+          import java.time.ZoneOffset
+
+          val Panel = Color(0xFF0D0D14)
+          val Purple = Color(0xFFB44CFF)
+          val Cyan = Color(0xFF00E5FF)
+          val Blue = Color(0xFF3D7BFF)
+          val Dim = Color(0xFF8A8AA0)
+
+          fun periodColor(p: String) = when (p) { Period.MORNING -> Purple; Period.EVENING -> Cyan; else -> Blue }
+          fun periodLabel(p: String) = when (p) { Period.MORNING -> "Morning · Deep learning"; Period.EVENING -> "Evening · Practice"; else -> "Night · Revision" }
+          fun periodShort(p: String) = when (p) { Period.MORNING -> "Morning"; Period.EVENING -> "Evening"; else -> "Night" }
+          fun typeLabel(t: String) = when (t) { TType.LEARN -> "Learn"; TType.PRACTICE -> "Practice"; TType.REVISE -> "Revision"; else -> "Weekly review" }
+          fun hm(m: Int) = "%02d:%02d".format(m / 60, m % 60)
+
+          @Composable
+          fun GlowRing(progress: Float, color: Color, modifier: Modifier = Modifier, stroke: Dp = 10.dp, content: @Composable BoxScope.() -> Unit = {}) {
+              val p by animateFloatAsState(progress.coerceIn(0f, 1f), tween(600), label = "ring")
+              Box(modifier, contentAlignment = Alignment.Center) {
+                  Canvas(Modifier.fillMaxSize().padding(stroke * 1.8f)) {
+                      val s = stroke.toPx()
+                      drawArc(color = color.copy(alpha = .12f), startAngle = 0f, sweepAngle = 360f, useCenter = false, style = Stroke(s))
+                      if (p > 0f) {
+                          for ((w, a) in listOf(3.2f to .05f, 2.2f to .09f, 1.5f to .15f))
+                              drawArc(color = color.copy(alpha = a), startAngle = -90f, sweepAngle = 360f * p, useCenter = false, style = Stroke(s * w, cap = StrokeCap.Round))
+                          drawArc(color = color, startAngle = -90f, sweepAngle = 360f * p, useCenter = false, style = Stroke(s, cap = StrokeCap.Round))
+                      }
+                  }
+                  content()
+              }
+          }
+
+          @Composable
+          fun NeonCard(color: Color, modifier: Modifier = Modifier, onClick: (() -> Unit)? = null, content: @Composable ColumnScope.() -> Unit) {
+              val shape = RoundedCornerShape(22.dp)
+              val m = modifier.clip(shape).background(Panel)
+                  .border(1.dp, Brush.linearGradient(listOf(color.copy(.7f), color.copy(.08f))), shape)
+              val m2 = if (onClick != null) m.clickable(onClick = onClick) else m
+              Column(m2.padding(16.dp), content = content)
+          }
+
+          @Composable
+          fun NeonButton(text: String, color: Color, modifier: Modifier = Modifier, onClick: () -> Unit) {
+              val h = LocalHapticFeedback.current
+              val shape = RoundedCornerShape(14.dp)
+              Box(
+                  modifier.clip(shape).background(color.copy(.16f)).border(1.dp, color.copy(.8f), shape)
+                      .clickable { h.performHapticFeedback(HapticFeedbackType.LongPress); onClick() }
+                      .padding(horizontal = 16.dp, vertical = 10.dp),
+                  contentAlignment = Alignment.Center
+              ) { Text(text, color = color, fontWeight = FontWeight.Medium, fontSize = 14.sp) }
+          }
+
+          @Composable
+          fun Choice(options: List<String>, selected: Int, onSelect: (Int) -> Unit) {
+              Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                  options.forEachIndexed { i, o -> FilterChip(selected = i == selected, onClick = { onSelect(i) }, label = { Text(o) }) }
+              }
+          }
+
+          @Composable
+          fun Stepper(label: String, value: Int, min: Int, max: Int, step: Int = 1, fmt: (Int) -> String = { it.toString() }, onChange: (Int) -> Unit) {
+              val h = LocalHapticFeedback.current
+              Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                  Text(label, Modifier.weight(1f))
+                  TextButton({ if (value - step >= min) { h.performHapticFeedback(HapticFeedbackType.TextHandleMove); onChange(value - step) } }) { Text("−") }
+                  Text(fmt(value), color = Cyan, modifier = Modifier.widthIn(min = 64.dp), textAlign = TextAlign.Center)
+                  TextButton({ if (value + step <= max) { h.performHapticFeedback(HapticFeedbackType.TextHandleMove); onChange(value + step) } }) { Text("+") }
+              }
+          }
+
+          @Composable
+          fun Burst(trigger: Int, color: Color) {
+              val a = remember { Animatable(0f) }
+              LaunchedEffect(trigger) { if (trigger > 0) { a.snapTo(0f); a.animateTo(1f, tween(800)) } }
+              if (a.value > 0f && a.value < 1f) Canvas(Modifier.fillMaxSize()) {
+                  for (i in 0 until 3) drawCircle(color = color.copy(alpha = (1f - a.value) * .5f),
+                      radius = size.minDimension * .9f * a.value * (1f - i * .15f), center = center, style = Stroke(6f + i * 4f))
+              }
+          }
+
+          @Composable
+          fun MenuItem(label: String, onClick: () -> Unit) {
+              TextButton(onClick, Modifier.fillMaxWidth()) { Text(label, Modifier.fillMaxWidth()) }
+          }
+
+          @Composable
+          fun RateDialog(title: String, onRate: (Int) -> Unit, onDismiss: () -> Unit, extra: @Composable ColumnScope.() -> Unit = {}) {
+              AlertDialog(onDismissRequest = onDismiss, containerColor = Panel, confirmButton = {},
+                  dismissButton = { TextButton(onDismiss) { Text("Later") } },
+                  title = { Text(title) },
+                  text = {
+                      Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                          Text("How well did you understand it?", color = Dim)
+                          listOf("Fully understood" to 3, "Partially understood" to 2, "Difficult to understand" to 1, "Need more study time" to 0)
+                              .forEach { (l, v) -> OutlinedButton({ onRate(v) }, Modifier.fillMaxWidth()) { Text(l) } }
+                          extra()
+                      }
+                  })
+          }
+
+          @OptIn(ExperimentalMaterial3Api::class)
+          @Composable
+          fun DayPicker(onDismiss: () -> Unit, onPick: (Long) -> Unit) {
+              val st = rememberDatePickerState(initialSelectedDateMillis = System.currentTimeMillis() + 86_400_000L)
+              DatePickerDialog(onDismissRequest = onDismiss, confirmButton = {
+                  TextButton({
+                      st.selectedDateMillis?.let { onPick(Instant.ofEpochMilli(it).atZone(ZoneOffset.UTC).toLocalDate().toEpochDay()) }
+                      onDismiss()
+                  }) { Text("OK") }
+              }) { DatePicker(state = st) }
+          }
+          EOF_13
+          mkdir -p "app/src/main/java/com/ragib/studyos/ui"
+          cat > "app/src/main/java/com/ragib/studyos/ui/Screens.kt" <<'EOF_14'
+          package com.ragib.studyos.ui
+
+          import android.app.Activity
+          import android.content.Intent
+          import android.net.Uri
+          import android.os.Build
+          import android.provider.Settings
+          import androidx.activity.compose.rememberLauncherForActivityResult
+          import androidx.activity.result.contract.ActivityResultContracts
+          import androidx.compose.animation.core.*
+          import androidx.compose.foundation.Canvas
+          import androidx.compose.foundation.background
+          import androidx.compose.foundation.clickable
+          import androidx.compose.foundation.horizontalScroll
+          import androidx.compose.foundation.layout.*
+          import androidx.compose.foundation.lazy.LazyColumn
+          import androidx.compose.foundation.lazy.items
+          import androidx.compose.foundation.rememberScrollState
+          import androidx.compose.foundation.verticalScroll
+          import androidx.compose.material3.*
+          import androidx.compose.runtime.*
+          import androidx.compose.ui.Alignment
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.draw.alpha
+          import androidx.compose.ui.geometry.Offset
+          import androidx.compose.ui.geometry.Size
+          import androidx.compose.ui.graphics.Color
+          import androidx.compose.ui.platform.LocalContext
+          import androidx.compose.ui.platform.LocalView
+          import androidx.compose.ui.text.font.FontFamily
+          import androidx.compose.ui.text.font.FontWeight
+          import androidx.compose.ui.text.style.TextDecoration
+          import androidx.compose.ui.unit.dp
+          import androidx.compose.ui.unit.sp
+          import androidx.lifecycle.compose.collectAsStateWithLifecycle
+          import com.ragib.studyos.data.SubjectEntity
+          import com.ragib.studyos.data.TopicEntity
+          import com.ragib.studyos.domain.*
+          import com.ragib.studyos.system.fmtTime
+          import java.time.LocalDate
+          import java.time.format.DateTimeFormatter
+
+          // ======================= TODAY =======================
+          @Composable
+          fun TodayScreen(home: HomeViewModel, openFocus: () -> Unit) {
+              val all by home.tasks.collectAsStateWithLifecycle()
+              val undo by home.undoCount.collectAsStateWithLifecycle()
+              val prefs by home.prefs.collectAsStateWithLifecycle()
+              val shown = all.filter { it.task.status == TStatus.PENDING || it.task.status == TStatus.DONE }
+              val done = shown.count { it.task.status == TStatus.DONE }
+              val total = shown.size
+              var rate by remember { mutableStateOf<TaskView?>(null) }
+              var menu by remember { mutableStateOf<TaskView?>(null) }
+              var pick by remember { mutableStateOf<Pair<TaskView, Boolean>?>(null) }
+              var quick by remember { mutableStateOf(false) }
+              val accent = MaterialTheme.colorScheme.primary
+
+              LazyColumn(Modifier.fillMaxSize().padding(horizontal = 16.dp), contentPadding = PaddingValues(vertical = 20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                  item {
+                      Row(verticalAlignment = Alignment.CenterVertically) {
+                          Column(Modifier.weight(1f)) {
+                              Text("Today at a glance", fontSize = 26.sp, fontWeight = FontWeight.Light, letterSpacing = 1.sp)
+                              Text(LocalDate.now().format(DateTimeFormatter.ofPattern("EEEE, d MMM")), color = Dim)
+                          }
+                          GlowRing(if (total == 0) 0f else done / total.toFloat(), accent, Modifier.size(88.dp), 6.dp) {
+                              Text("$done/$total", fontWeight = FontWeight.Bold)
+                          }
+                      }
+                  }
+                  item {
+                      Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                          Period.all.forEach { per ->
+                              val l = shown.filter { it.task.period == per }
+                              NeonCard(periodColor(per), Modifier.weight(1f)) {
+                                  Text(periodShort(per), color = periodColor(per), fontSize = 12.sp)
+                                  Text("${l.count { it.task.status == TStatus.DONE }}/${l.size}", fontSize = 22.sp, fontWeight = FontWeight.Light)
+                                  Text(if (l.isEmpty()) "none" else "${l.count { it.task.status == TStatus.PENDING }} left", color = Dim, fontSize = 12.sp)
+                              }
+                          }
+                      }
+                  }
+                  item {
+                      Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                          NeonButton("Quick timer", Cyan) { quick = true }
+                          NeonButton("I'm overwhelmed", Purple) { home.overwhelmed() }
+                          NeonButton(if (undo > 0) "Undo ($undo)" else "Undo", Blue) { home.undo() }
+                      }
+                  }
+                  Period.all.forEach { per ->
+                      val l = shown.filter { it.task.period == per }
+                      if (l.isNotEmpty()) {
+                          item(key = "h$per") { Text(periodLabel(per), color = periodColor(per), fontWeight = FontWeight.Medium) }
+                          items(l, key = { it.task.id }) { tv ->
+                              TaskCard(tv, onStart = { home.start(tv); openFocus() }, onDone = { rate = tv }, onMore = { menu = tv })
+                          }
+                      }
+                  }
+                  if (total == 0) item { Text("Nothing scheduled today. Add subjects and topics in Library, then activate a subject — the plan fills itself.", color = Dim) }
+              }
+
+              rate?.let { tv -> RateDialog(tv.title, { u -> home.complete(tv.task.id, u, tv.task.period); rate = null }, { rate = null }) }
+
+              menu?.let { tv ->
+                  val t = tv.task
+                  AlertDialog(onDismissRequest = { menu = null }, containerColor = Panel, confirmButton = {}, title = { Text(tv.title) },
+                      text = {
+                          Column(Modifier.verticalScroll(rememberScrollState())) {
+                              MenuItem("Continue now") { menu = null; home.start(tv); openFocus() }
+                              MenuItem("Not finished → continue tomorrow") { menu = null; home.incomplete(t.id, today() + 1) }
+                              MenuItem("Not finished → pick another day") { menu = null; pick = tv to true }
+                              MenuItem("Not finished → let the app recover it") { menu = null; home.incomplete(t.id, null) }
+                              MenuItem("Reschedule to tomorrow") { menu = null; home.reschedule(t.id, today() + 1) }
+                              MenuItem("Reschedule to a date") { menu = null; pick = tv to false }
+                              MenuItem("Extra study session tomorrow") { menu = null; home.extra(t.topicId, today() + 1) }
+                          }
+                      })
+              }
+              pick?.let { (tv, inc) ->
+                  DayPicker({ pick = null }) { d ->
+                      if (d >= today()) { if (inc) home.incomplete(tv.task.id, d) else home.reschedule(tv.task.id, d) }
+                  }
+              }
+              if (quick) {
+                  var min by remember { mutableIntStateOf(prefs.sessionMin) }
+                  AlertDialog(onDismissRequest = { quick = false }, containerColor = Panel,
+                      title = { Text("Quick timer") },
+                      text = { Stepper("Minutes", min, 5, 180, 5) { min = it } },
+                      confirmButton = { TextButton({ quick = false; home.quick(min); openFocus() }) { Text("Start") } },
+                      dismissButton = { TextButton({ quick = false }) { Text("Cancel") } })
+              }
+          }
+
+          @Composable
+          fun TaskCard(tv: TaskView, onStart: () -> Unit, onDone: () -> Unit, onMore: () -> Unit) {
+              val t = tv.task; val c = periodColor(t.period); val d = t.status == TStatus.DONE
+              NeonCard(if (d) Dim else c) {
+                  Text(tv.title, fontSize = 17.sp, fontWeight = FontWeight.Medium, color = if (d) Dim else Color.White,
+                      textDecoration = if (d) TextDecoration.LineThrough else null)
+                  Text("${tv.subject} · ${typeLabel(t.type)} · ${t.plannedMin} min" + if (t.spentSec > 0) " · ${t.spentSec / 60} min spent" else "", color = Dim, fontSize = 12.sp)
+                  if (!d) {
+                      Spacer(Modifier.height(10.dp))
+                      Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                          NeonButton("Start", c, onClick = onStart)
+                          NeonButton("Done", Cyan, onClick = onDone)
+                          NeonButton("⋯", Dim, onClick = onMore)
+                      }
+                  }
+              }
+          }
+
+          // ======================= FOCUS =======================
+          @Composable
+          fun FocusScreen(home: HomeViewModel, onExit: () -> Unit) {
+              val s by home.timer.state.collectAsStateWithLifecycle()
+              val color = if (s.isBreak) Cyan else periodColor(s.period)
+              val view = LocalView.current
+              DisposableEffect(Unit) { view.keepScreenOn = true; onDispose { view.keepScreenOn = false } }
+              val pulse by rememberInfiniteTransition(label = "p").animateFloat(.65f, 1f, infiniteRepeatable(tween(1600), RepeatMode.Reverse), label = "a")
+              Column(Modifier.fillMaxSize().background(Color.Black).padding(24.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+                  Row(Modifier.fillMaxWidth()) { TextButton(onExit) { Text("← Exit focus", color = Dim) } }
+                  Spacer(Modifier.weight(1f))
+                  if (s.state == "IDLE" || s.state == "FINISHED") {
+                      Text("No active session", color = Dim)
+                      Text("Start one from Today.", color = Dim, fontSize = 12.sp)
+                  } else {
+                      Text(if (s.isBreak) "Break" else s.title, fontSize = 22.sp, fontWeight = FontWeight.Light, letterSpacing = 1.sp)
+                      Spacer(Modifier.height(24.dp))
+                      val prog = if (s.totalSec == 0) 0f else 1f - s.remainingSec / s.totalSec.toFloat()
+                      GlowRing(prog, color, Modifier.size(300.dp).alpha(if (s.state == "RUNNING") pulse else 1f), 10.dp) {
+                          Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                              Text(fmtTime(s.remainingSec), fontSize = 54.sp, fontFamily = FontFamily.Monospace, fontWeight = FontWeight.Light)
+                              Text(if (s.state == "PAUSED") "PAUSED" else "${(prog * 100).toInt()}%", color = color)
+                          }
+                      }
+                      Spacer(Modifier.height(32.dp))
+                      Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                          if (s.state == "RUNNING") NeonButton("Pause", color) { home.timer.pause() } else NeonButton("Resume", color) { home.timer.resume() }
+                          NeonButton(if (s.isBreak) "Skip break" else "Stop", Dim) { home.timer.stop() }
+                      }
+                  }
+                  Spacer(Modifier.weight(1f))
+              }
+          }
+
+          // ======================= LIBRARY =======================
+          @Composable
+          fun LibraryScreen(vm: LibraryViewModel) {
+              val subjects by vm.subjects.collectAsStateWithLifecycle()
+              val topics by vm.topics.collectAsStateWithLifecycle()
+              var expanded by remember { mutableStateOf(setOf<Long>()) }
+              var addSubject by remember { mutableStateOf(false) }
+              var addTopicsFor by remember { mutableStateOf<SubjectEntity?>(null) }
+              var activateFor by remember { mutableStateOf<SubjectEntity?>(null) }
+              var editTopic by remember { mutableStateOf<TopicEntity?>(null) }
+              var deleteSubject by remember { mutableStateOf<SubjectEntity?>(null) }
+              val diffs = listOf("Easy", "Medium", "Hard")
+
+              LazyColumn(Modifier.fillMaxSize().padding(horizontal = 16.dp), contentPadding = PaddingValues(vertical = 20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                  item {
+                      Row(verticalAlignment = Alignment.CenterVertically) {
+                          Column(Modifier.weight(1f)) {
+                              Text("Master Topic Library", fontSize = 24.sp, fontWeight = FontWeight.Light)
+                              Text("${subjects.size} subjects · ${topics.size} topics", color = Dim)
+                          }
+                          NeonButton("+ Subject", Cyan) { addSubject = true }
+                      }
+                  }
+                  if (subjects.isEmpty()) item { Text("Add a subject with its whole syllabus once. Topics flow into the daily plan and revisions automatically.", color = Dim) }
+                  items(subjects, key = { it.id }) { s ->
+                      val ts = topics.filter { it.subjectId == s.id }
+                      val learned = ts.count { it.status == TopicStatus.LEARNED }
+                      val c = if (s.active) Purple else Dim
+                      NeonCard(c) {
+                          Row(verticalAlignment = Alignment.CenterVertically) {
+                              GlowRing(if (ts.isEmpty()) 0f else learned / ts.size.toFloat(), c, Modifier.size(64.dp), 5.dp) {
+                                  Text("${if (ts.isEmpty()) 0 else learned * 100 / ts.size}%", fontSize = 11.sp)
+                              }
+                              Column(Modifier.weight(1f).padding(start = 8.dp).clickable { expanded = if (s.id in expanded) expanded - s.id else expanded + s.id }) {
+                                  Text(s.name, fontSize = 18.sp, fontWeight = FontWeight.Medium)
+                                  Text("$learned/${ts.size} learned · " + if (s.active) "active · ${s.dailyMin} min/day" else "inactive", color = Dim, fontSize = 12.sp)
+                              }
+                          }
+                          Spacer(Modifier.height(8.dp))
+                          Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                              NeonButton(if (s.active) "Settings" else "Activate", Purple) { activateFor = s }
+                              NeonButton("+ Topics", Cyan) { addTopicsFor = s }
+                              NeonButton(if (s.id in expanded) "Hide" else "Topics", Blue) { expanded = if (s.id in expanded) expanded - s.id else expanded + s.id }
+                              NeonButton("Delete", Dim) { deleteSubject = s }
+                          }
+                          if (s.id in expanded) {
+                              Spacer(Modifier.height(8.dp))
+                              ts.forEach { t ->
+                                  Row(Modifier.fillMaxWidth().clickable { editTopic = t }.padding(vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) {
+                                      Text(t.title, Modifier.weight(1f))
+                                      Text(when (t.status) { TopicStatus.LEARNED -> "learned"; TopicStatus.SCHEDULED -> "scheduled"; else -> "new" } + " · ${diffs[t.difficulty - 1]}",
+                                          color = when (t.status) { TopicStatus.LEARNED -> Cyan; TopicStatus.SCHEDULED -> Purple; else -> Dim }, fontSize = 12.sp)
+                                  }
+                              }
+                          }
+                      }
+                  }
+              }
+
+              if (addSubject) {
+                  var name by remember { mutableStateOf("") }; var raw by remember { mutableStateOf("") }; var diff by remember { mutableIntStateOf(1) }
+                  AlertDialog(onDismissRequest = { addSubject = false }, containerColor = Panel, title = { Text("New subject") },
+                      text = {
+                          Column(Modifier.verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                              OutlinedTextField(name, { name = it }, label = { Text("Subject name") }, singleLine = true)
+                              OutlinedTextField(raw, { raw = it }, label = { Text("Topics — one per line") }, minLines = 5,
+                                  supportingText = { Text("Optional per-line difficulty: \"Algebra :: 3\" (1 easy – 3 hard)") })
+                              Text("Default difficulty", color = Dim); Choice(diffs, diff) { diff = it }
+                          }
+                      },
+                      confirmButton = { TextButton({ vm.addSubject(name, raw, diff + 1); addSubject = false }) { Text("Save") } },
+                      dismissButton = { TextButton({ vm.addSubject(name, raw, diff + 1); name = ""; raw = "" }) { Text("Save + another") } })
+              }
+              addTopicsFor?.let { s ->
+                  var raw by remember { mutableStateOf("") }; var diff by remember { mutableIntStateOf(1) }
+                  AlertDialog(onDismissRequest = { addTopicsFor = null }, containerColor = Panel, title = { Text("Add topics to ${s.name}") },
+                      text = {
+                          Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                              OutlinedTextField(raw, { raw = it }, label = { Text("One topic per line") }, minLines = 5,
+                                  supportingText = { Text("Optional: \"Topic :: 3\"") })
+                              Choice(diffs, diff) { diff = it }
+                          }
+                      },
+                      confirmButton = { TextButton({ vm.addTopics(s.id, raw, diff + 1); addTopicsFor = null }) { Text("Add") } },
+                      dismissButton = { TextButton({ addTopicsFor = null }) { Text("Cancel") } })
+              }
+              activateFor?.let { s ->
+                  var min by remember { mutableIntStateOf(s.dailyMin) }
+                  var per by remember { mutableIntStateOf(listOf("AUTO", Period.MORNING, Period.EVENING).indexOf(s.period).coerceAtLeast(0)) }
+                  var prio by remember { mutableIntStateOf(s.priority - 1) }
+                  AlertDialog(onDismissRequest = { activateFor = null }, containerColor = Panel, title = { Text(if (s.active) "${s.name} settings" else "Activate ${s.name}") },
+                      text = {
+                          Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                              Stepper("Study per day", min, 15, 360, 15, { "$it min" }) { min = it }
+                              Text("Preferred period", color = Dim); Choice(listOf("Auto", "Morning", "Evening"), per) { per = it }
+                              Text("Priority", color = Dim); Choice(listOf("Low", "Normal", "High"), prio) { prio = it }
+                          }
+                      },
+                      confirmButton = { TextButton({ vm.activate(s, min, listOf("AUTO", Period.MORNING, Period.EVENING)[per], prio + 1); activateFor = null }) { Text(if (s.active) "Save" else "Activate") } },
+                      dismissButton = { Row { if (s.active) TextButton({ vm.deactivate(s); activateFor = null }) { Text("Pause") }; TextButton({ activateFor = null }) { Text("Cancel") } } })
+              }
+              editTopic?.let { t ->
+                  var title by remember { mutableStateOf(t.title) }; var diff by remember { mutableIntStateOf(t.difficulty - 1) }
+                  AlertDialog(onDismissRequest = { editTopic = null }, containerColor = Panel, title = { Text("Topic") },
+                      text = {
+                          Column(Modifier.verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                              OutlinedTextField(title, { title = it }, singleLine = true)
+                              Choice(diffs, diff) { diff = it }
+                              MenuItem("Add to today") { vm.addToToday(t.id); editTopic = null }
+                              MenuItem("Extra session tomorrow") { vm.extraTomorrow(t.id); editTopic = null }
+                              MenuItem("Delete topic (undoable)") { vm.deleteTopic(t); editTopic = null }
+                          }
+                      },
+                      confirmButton = { TextButton({ if (title.isNotBlank()) vm.saveTopic(t.copy(title = title.trim(), difficulty = diff + 1)); editTopic = null }) { Text("Save") } },
+                      dismissButton = { TextButton({ editTopic = null }) { Text("Cancel") } })
+              }
+              deleteSubject?.let { s ->
+                  AlertDialog(onDismissRequest = { deleteSubject = null }, containerColor = Panel, title = { Text("Delete ${s.name}?") },
+                      text = { Text("This removes the subject, its topics and their schedules. Export a backup first if unsure.") },
+                      confirmButton = { TextButton({ vm.deleteSubject(s); deleteSubject = null }) { Text("Delete") } },
+                      dismissButton = { TextButton({ deleteSubject = null }) { Text("Cancel") } })
+              }
+          }
+
+          // ======================= STATS =======================
+          @Composable
+          fun StatsScreen(vm: StatsViewModel) {
+              val s by vm.ui.collectAsStateWithLifecycle()
+              LazyColumn(Modifier.fillMaxSize().padding(horizontal = 16.dp), contentPadding = PaddingValues(vertical = 20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                  item { Text("Progress", fontSize = 24.sp, fontWeight = FontWeight.Light) }
+                  item {
+                      val items = listOf("Subjects" to s.subjects, "Topics" to s.topics, "Learned" to s.learned, "Need more study" to s.needMore,
+                          "Study minutes" to s.totalMin.toInt(), "Sessions today" to s.sessionsToday, "Revisions done" to s.revisionsDone,
+                          "Missed" to s.missed, "Rescheduled" to s.rescheduled)
+                      NeonCard(Cyan) {
+                          items.chunked(3).forEach { row ->
+                              Row(Modifier.fillMaxWidth().padding(vertical = 4.dp)) {
+                                  row.forEach { (l, v) -> Column(Modifier.weight(1f)) { Text("$v", fontSize = 22.sp, fontWeight = FontWeight.Light, color = Cyan); Text(l, color = Dim, fontSize = 11.sp) } }
+                              }
+                          }
+                      }
+                  }
+                  item {
+                      NeonCard(Purple) {
+                          Text("Last 7 days (minutes)", color = Dim, fontSize = 12.sp)
+                          val mx = maxOf(1, s.week.maxOfOrNull { it.second } ?: 1)
+                          Canvas(Modifier.fillMaxWidth().height(120.dp).padding(top = 8.dp)) {
+                              val n = s.week.size.coerceAtLeast(1); val w = size.width / n
+                              s.week.forEachIndexed { i, (_, v) ->
+                                  val h = size.height * v / mx
+                                  drawRect(Purple.copy(alpha = .25f), Offset(i * w + w * .2f, size.height - h - 4f), Size(w * .6f, h + 4f))
+                                  drawRect(Purple, Offset(i * w + w * .2f, size.height - h - 4f), Size(w * .6f, 4f))
+                              }
+                          }
+                          Row(Modifier.fillMaxWidth()) { s.week.forEach { (d, v) -> Column(Modifier.weight(1f), horizontalAlignment = Alignment.CenterHorizontally) { Text("$v", fontSize = 10.sp); Text(d, fontSize = 10.sp, color = Dim) } } }
+                      }
+                  }
+                  item {
+                      NeonCard(Blue) {
+                          Text("Understanding", color = Dim, fontSize = 12.sp)
+                          val names = listOf("Need more time", "Difficult", "Partial", "Full"); val mx = maxOf(1, s.understanding.max())
+                          names.forEachIndexed { i, n ->
+                              Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(vertical = 3.dp)) {
+                                  Text(n, Modifier.width(110.dp), fontSize = 12.sp)
+                                  LinearProgressIndicator(progress = { s.understanding[i] / mx.toFloat() }, Modifier.weight(1f), color = Blue, trackColor = Blue.copy(.15f))
+                                  Text("  ${s.understanding[i]}", fontSize = 12.sp)
+                              }
+                          }
+                      }
+                  }
+                  item { Text("By subject", color = Dim) }
+                  items(s.perSubject) { p ->
+                      NeonCard(Cyan) {
+                          Row(verticalAlignment = Alignment.CenterVertically) {
+                              GlowRing(if (p.total == 0) 0f else p.learned / p.total.toFloat(), Cyan, Modifier.size(56.dp), 5.dp) {}
+                              Column(Modifier.padding(start = 8.dp)) { Text(p.name, fontWeight = FontWeight.Medium); Text("${p.learned}/${p.total} topics", color = Dim, fontSize = 12.sp) }
+                          }
+                      }
+                  }
+                  if (s.log.isNotEmpty()) {
+                      item { Text("Incomplete history", color = Dim) }
+                      items(s.log) { Text("• $it", fontSize = 13.sp) }
+                  }
+              }
+          }
+
+          // ======================= SETTINGS =======================
+          @Composable
+          fun SettingsScreen(vm: SettingsViewModel) {
+              val p by vm.prefs.collectAsStateWithLifecycle()
+              val status by vm.status.collectAsStateWithLifecycle()
+              val ctx = LocalContext.current
+              val export = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/json")) { it?.let(vm::export) }
+              val importer = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { it?.let(vm::restore) }
+
+              @Composable fun Section(title: String, color: Color = Cyan, body: @Composable ColumnScope.() -> Unit) {
+                  NeonCard(color) { Text(title, color = color, fontWeight = FontWeight.Medium); Spacer(Modifier.height(4.dp)); body() }
+              }
+              Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                  Text("Settings", fontSize = 24.sp, fontWeight = FontWeight.Light)
+                  Section("Daily plan") {
+                      Row(verticalAlignment = Alignment.CenterVertically) { Text("Automatic scheduling", Modifier.weight(1f)); Switch(p.auto, { v -> vm.update { it.copy(auto = v) } }) }
+                      Stepper("Daily study limit", p.dailyLimit, 60, 720, 15, { "$it min" }) { v -> vm.update { it.copy(dailyLimit = v) } }
+                      Stepper("Max tasks per day", p.maxTasks, 3, 30) { v -> vm.update { it.copy(maxTasks = v) } }
+                  }
+                  Section("Morning", Purple) {
+                      Stepper("Starts", p.morningStart, 0, 1410, 30, ::hm) { v -> vm.update { it.copy(morningStart = v) } }
+                      Stepper("Budget", p.morningBudget, 15, 360, 15, { "$it min" }) { v -> vm.update { it.copy(morningBudget = v) } }
+                  }
+                  Section("Evening", Cyan) {
+                      Stepper("Starts", p.eveningStart, 0, 1410, 30, ::hm) { v -> vm.update { it.copy(eveningStart = v) } }
+                      Stepper("Budget", p.eveningBudget, 15, 360, 15, { "$it min" }) { v -> vm.update { it.copy(eveningBudget = v) } }
+                  }
+                  Section("Night", Blue) {
+                      Stepper("Starts", p.nightStart, 0, 1410, 30, ::hm) { v -> vm.update { it.copy(nightStart = v) } }
+                      Stepper("Budget", p.nightBudget, 10, 180, 5, { "$it min" }) { v -> vm.update { it.copy(nightBudget = v) } }
+                  }
+                  Section("Sessions") {
+                      Stepper("Session length", p.sessionMin, 10, 120, 5, { "$it min" }) { v -> vm.update { it.copy(sessionMin = v) } }
+                      Stepper("Break length", p.breakMin, 1, 30, 1, { "$it min" }) { v -> vm.update { it.copy(breakMin = v) } }
+                      Stepper("Revision length", p.revisionMin, 5, 30, 5, { "$it min" }) { v -> vm.update { it.copy(revisionMin = v) } }
+                  }
+                  Section("Revision intervals (days)", Purple) {
+                      (0..3).forEach { i ->
+                          Stepper("Revision ${i + 1}", p.intervals.getOrElse(i) { p.intervals.last() }, 1, 60) { v ->
+                              vm.update { c -> c.copy(intervals = (0..3).map { j -> if (j == i) v else c.intervals.getOrElse(j) { c.intervals.last() } }) }
+                          }
+                      }
+                      Row(verticalAlignment = Alignment.CenterVertically) { Text("Friday weekly revision", Modifier.weight(1f)); Switch(p.friday, { v -> vm.update { it.copy(friday = v) } }) }
+                  }
+                  Section("Notifications") {
+                      Text("Sound", color = Dim)
+                      Choice(listOf("Default", "Alarm", "Silent"), listOf("DEFAULT", "ALARM", "SILENT").indexOf(p.sound)) { i -> vm.update { it.copy(sound = listOf("DEFAULT", "ALARM", "SILENT")[i]) } }
+                      Spacer(Modifier.height(6.dp)); Text("Vibration", color = Dim)
+                      Choice(listOf("Off", "Light", "Normal", "Strong"), listOf("OFF", "LIGHT", "NORMAL", "STRONG").indexOf(p.vibration)) { i -> vm.update { it.copy(vibration = listOf("OFF", "LIGHT", "NORMAL", "STRONG")[i]) } }
+                      Spacer(Modifier.height(8.dp))
+                      Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.horizontalScroll(rememberScrollState())) {
+                          NeonButton("Notification settings", Cyan) {
+                              ctx.startActivity(Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS).putExtra(Settings.EXTRA_APP_PACKAGE, ctx.packageName))
+                          }
+                          if (Build.VERSION.SDK_INT >= 31) NeonButton("Exact alarms", Purple) {
+                              ctx.startActivity(Intent(Settings.ACTION_REQUEST_SCHEDULE_EXACT_ALARM, Uri.parse("package:${ctx.packageName}")))
+                          }
+                      }
+                  }
+                  Section("Accent colour") { Choice(listOf("Purple", "Cyan", "Blue"), p.accent) { i -> vm.update { it.copy(accent = i) } } }
+                  Section("Backup (JSON)", Blue) {
+                      Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                          NeonButton("Export", Blue) { export.launch("studyos-backup.json") }
+                          NeonButton("Import", Cyan) { importer.launch(arrayOf("*/*")) }
+                      }
+                      if (status.isNotEmpty()) Text(status, color = Dim, fontSize = 12.sp)
+                  }
+              }
+          }
+          EOF_14
+          mkdir -p "app/src/main/java/com/ragib/studyos/ui"
+          cat > "app/src/main/java/com/ragib/studyos/ui/Theme.kt" <<'EOF_15'
+          package com.ragib.studyos.ui
+
+          import androidx.compose.material3.MaterialTheme
+          import androidx.compose.material3.darkColorScheme
+          import androidx.compose.runtime.Composable
+          import androidx.compose.ui.graphics.Color
+
+          @Composable
+          fun StudyTheme(accent: Int, content: @Composable () -> Unit) {
+              val a = listOf(Purple, Cyan, Blue)[accent.coerceIn(0, 2)]
+              MaterialTheme(
+                  colorScheme = darkColorScheme(
+                      primary = a, onPrimary = Color.Black, secondary = Cyan, background = Color.Black, surface = Panel,
+                      onBackground = Color.White, onSurface = Color.White, surfaceVariant = Panel, onSurfaceVariant = Dim
+                  ),
+                  content = content
+              )
+          }
+          EOF_15
+          mkdir -p "app/src/main/java/com/ragib/studyos/ui"
+          cat > "app/src/main/java/com/ragib/studyos/ui/ViewModels.kt" <<'EOF_16'
+          package com.ragib.studyos.ui
+
+          import android.content.Context
+          import android.net.Uri
+          import androidx.lifecycle.ViewModel
+          import androidx.lifecycle.viewModelScope
+          import com.ragib.studyos.data.*
+          import com.ragib.studyos.domain.*
+          import com.ragib.studyos.system.AlarmScheduler
+          import com.ragib.studyos.system.TimerController
+          import dagger.hilt.android.lifecycle.HiltViewModel
+          import dagger.hilt.android.qualifiers.ApplicationContext
+          import kotlinx.coroutines.ExperimentalCoroutinesApi
+          import kotlinx.coroutines.FlowPreview
+          import kotlinx.coroutines.flow.*
+          import kotlinx.coroutines.launch
+          import java.time.Instant
+          import java.time.LocalDate
+          import java.time.ZoneId
+          import java.time.format.TextStyle
+          import java.util.Locale
+          import javax.inject.Inject
+
+          data class TaskView(val task: DailyTaskEntity, val title: String, val subject: String, val difficulty: Int)
+
+          fun parseTopics(raw: String, def: Int): List<Pair<String, Int>> = raw.lines().map { it.trim() }.filter { it.isNotEmpty() }.map { l ->
+              val i = l.lastIndexOf("::")
+              val n = if (i > 0) l.substring(i + 2).trim().toIntOrNull() else null
+              if (n != null && n in 1..3) l.substring(0, i).trim() to n else l to def
+          }
+
+          @OptIn(ExperimentalCoroutinesApi::class, FlowPreview::class)
+          @HiltViewModel
+          class HomeViewModel @Inject constructor(
+              private val repo: StudyRepository, private val scheduler: Scheduler, private val alarms: AlarmScheduler,
+              private val prefsRepo: PrefsRepository, val timer: TimerController
+          ) : ViewModel() {
+              val day = MutableStateFlow(today())
+              val prefs = prefsRepo.flow.stateIn(viewModelScope, SharingStarted.Eagerly, Prefs())
+              val tasks: StateFlow<List<TaskView>> = day.flatMapLatest { d ->
+                  combine(repo.tasksForDay(d), repo.topics(), repo.subjects()) { ts, tp, sb ->
+                      val tm = tp.associateBy { it.id }; val sm = sb.associateBy { it.id }
+                      ts.mapNotNull { t ->
+                          val tpc = tm[t.topicId] ?: return@mapNotNull null
+                          TaskView(t, tpc.title, sm[tpc.subjectId]?.name ?: "", tpc.difficulty)
+                      }
+                  }
+              }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+              val undoCount = repo.undoCount().stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), 0)
+              val burst = MutableStateFlow(0 to Period.MORNING)
+              val message = MutableSharedFlow<String>(extraBufferCapacity = 8)
+
+              init {
+                  viewModelScope.launch {
+                      combine(repo.subjects(), repo.topics().map { it.size }.distinctUntilChanged(), prefsRepo.flow) { _, _, _ -> }
+                          .debounce(400).collect { refreshNow() }
+                  }
+              }
+
+              private suspend fun refreshNow() { val d = today(); day.value = d; scheduler.generate(d); alarms.scheduleAll() }
+              fun refresh() { viewModelScope.launch { refreshNow() } }
+
+              fun complete(id: Long, u: Int, period: String) = viewModelScope.launch {
+                  repo.completeTask(id, u); burst.update { it.first + 1 to period }
+              }
+              fun start(t: TaskView) {
+                  if (timer.state.value.state != "IDLE") { message.tryEmit("A session is already running"); return }
+                  val sec = (t.task.plannedMin * 60 - t.task.spentSec).coerceAtLeast(300)
+                  timer.start(t.task.id, t.task.topicId, t.title, t.task.period, sec)
+              }
+              fun quick(min: Int) {
+                  if (timer.state.value.state != "IDLE") { message.tryEmit("A session is already running"); return }
+                  timer.start(null, null, "Free session", currentPeriod(prefs.value), min * 60)
+              }
+              fun startBreak() {
+                  timer.reset(); timer.start(null, null, "Break", Period.EVENING, prefs.value.breakMin * 60, true)
+              }
+              fun incomplete(id: Long, toDay: Long?) = viewModelScope.launch {
+                  repo.markIncomplete(id, toDay)
+                  message.tryEmit(if (toDay == null) "Saved as incomplete — it will be rescheduled automatically" else "Rescheduled")
+              }
+              fun reschedule(id: Long, toDay: Long) = viewModelScope.launch { repo.reschedule(id, toDay); message.tryEmit("Rescheduled") }
+              fun extra(topicId: Long, toDay: Long) = viewModelScope.launch { repo.scheduleExtra(topicId, toDay); message.tryEmit("Extra session added") }
+              fun overwhelmed() = viewModelScope.launch {
+                  val n = repo.overwhelmed(today())
+                  message.tryEmit(if (n == 0) "Nothing to reduce — workload is already light" else "Moved $n lower-priority task(s) to tomorrow. Nothing deleted.")
+              }
+              fun undo() = viewModelScope.launch {
+                  val l = repo.undoLast(); message.tryEmit(if (l == null) "Nothing to undo" else "Undone: $l")
+              }
+          }
+
+          @HiltViewModel
+          class LibraryViewModel @Inject constructor(private val repo: StudyRepository) : ViewModel() {
+              val subjects = repo.subjects().stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+              val topics = repo.topics().stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+              fun addSubject(name: String, raw: String, diff: Int) = viewModelScope.launch { if (name.isNotBlank()) repo.addSubject(name, parseTopics(raw, diff)) }
+              fun addTopics(sid: Long, raw: String, diff: Int) = viewModelScope.launch { repo.addTopics(sid, parseTopics(raw, diff)) }
+              fun activate(s: SubjectEntity, min: Int, period: String, prio: Int) = viewModelScope.launch {
+                  repo.updateSubject(s.copy(active = true, dailyMin = min, period = period, priority = prio))
+              }
+              fun deactivate(s: SubjectEntity) = viewModelScope.launch { repo.updateSubject(s.copy(active = false)) }
+              fun deleteSubject(s: SubjectEntity) = viewModelScope.launch { repo.deleteSubject(s) }
+              fun saveTopic(t: TopicEntity) = viewModelScope.launch { repo.updateTopic(t) }
+              fun deleteTopic(t: TopicEntity) = viewModelScope.launch { repo.deleteTopic(t) }
+              fun addToToday(id: Long) = viewModelScope.launch { repo.addToToday(id) }
+              fun extraTomorrow(id: Long) = viewModelScope.launch { repo.scheduleExtra(id, today() + 1) }
+          }
+
+          data class SubjectProg(val name: String, val learned: Int, val total: Int)
+          data class StatsUi(
+              val subjects: Int = 0, val topics: Int = 0, val learned: Int = 0, val needMore: Int = 0, val totalMin: Long = 0,
+              val sessionsToday: Int = 0, val revisionsDone: Int = 0, val missed: Int = 0, val rescheduled: Int = 0,
+              val week: List<Pair<String, Int>> = emptyList(), val perSubject: List<SubjectProg> = emptyList(),
+              val understanding: List<Int> = listOf(0, 0, 0, 0), val log: List<String> = emptyList()
+          )
+
+          @HiltViewModel
+          class StatsViewModel @Inject constructor(repo: StudyRepository) : ViewModel() {
+              val ui: StateFlow<StatsUi> = combine(repo.subjects(), repo.topics(), repo.allTasks(), repo.sessions(), repo.history()) { sb, tp, ts, ss, hs ->
+                  val zone = ZoneId.systemDefault(); val td = today()
+                  fun dayOf(ms: Long) = Instant.ofEpochMilli(ms).atZone(zone).toLocalDate().toEpochDay()
+                  val study = ss.filter { !it.isBreak }
+                  val tm = tp.associateBy { it.id }
+                  StatsUi(
+                      subjects = sb.size, topics = tp.size, learned = tp.count { it.status == TopicStatus.LEARNED },
+                      needMore = tp.count { it.understanding in 0..1 }, totalMin = study.sumOf { it.spentSec } / 60L,
+                      sessionsToday = study.count { dayOf(it.startedAt) == td },
+                      revisionsDone = hs.count { it.kind == TType.REVISE || it.kind == TType.WEEKLY },
+                      missed = ts.count { it.status == TStatus.INCOMPLETE || it.status == TStatus.MOVED },
+                      rescheduled = ts.count { it.status == TStatus.RESCHEDULED || it.status == TStatus.MOVED },
+                      week = (6 downTo 0).map { i ->
+                          val d = td - i
+                          LocalDate.ofEpochDay(d).dayOfWeek.getDisplayName(TextStyle.SHORT, Locale.getDefault()) to
+                              (study.filter { dayOf(it.startedAt) == d }.sumOf { it.spentSec } / 60)
+                      },
+                      perSubject = sb.map { s -> val l = tp.filter { it.subjectId == s.id }; SubjectProg(s.name, l.count { it.status == TopicStatus.LEARNED }, l.size) },
+                      understanding = (0..3).map { u -> tp.count { it.understanding == u } },
+                      log = ts.filter { it.status == TStatus.INCOMPLETE || it.status == TStatus.MOVED }.sortedByDescending { it.day }.take(8)
+                          .map { "${tm[it.topicId]?.title ?: "?"} · ${LocalDate.ofEpochDay(it.day)} · ${it.spentSec / 60} min spent" }
+                  )
+              }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), StatsUi())
+          }
+
+          @HiltViewModel
+          class SettingsViewModel @Inject constructor(
+              private val prefsRepo: PrefsRepository, private val repo: StudyRepository,
+              private val alarms: AlarmScheduler, @ApplicationContext private val ctx: Context
+          ) : ViewModel() {
+              val prefs = prefsRepo.flow.stateIn(viewModelScope, SharingStarted.Eagerly, Prefs())
+              val status = MutableStateFlow("")
+              fun update(f: (Prefs) -> Prefs) = viewModelScope.launch { prefsRepo.update(f); alarms.scheduleAll() }
+              fun export(uri: Uri) = viewModelScope.launch {
+                  status.value = try {
+                      val json = repo.exportJson()
+                      ctx.contentResolver.openOutputStream(uri, "wt")!!.use { it.write(json.toByteArray()) }
+                      "Backup saved"
+                  } catch (e: Exception) { "Export failed: ${e.message}" }
+              }
+              fun restore(uri: Uri) = viewModelScope.launch {
+                  status.value = try {
+                      val s = ctx.contentResolver.openInputStream(uri)!!.use { String(it.readBytes()) }
+                      repo.importJson(s); alarms.scheduleAll(); "Backup restored"
+                  } catch (e: Exception) { "Import failed: ${e.message}" }
+              }
+          }
+          EOF_16
+          mkdir -p "app/src/main/res/values"
+          cat > "app/src/main/res/values/themes.xml" <<'EOF_17'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <style name="Theme.StudyOS" parent="android:Theme.Material.NoActionBar">
+                  <item name="android:windowBackground">@android:color/black</item>
+                  <item name="android:statusBarColor">@android:color/black</item>
+                  <item name="android:navigationBarColor">@android:color/black</item>
+              </style>
+          </resources>
+          EOF_17
+          cat > "build.gradle.kts" <<'EOF_18'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "2.0.20" apply false
+              id("org.jetbrains.kotlin.plugin.compose") version "2.0.20" apply false
+              id("com.google.devtools.ksp") version "2.0.20-1.0.25" apply false
+              id("com.google.dagger.hilt.android") version "2.51.1" apply false
+          }
+          EOF_18
+          cat > "gradle.properties" <<'EOF_19'
+          org.gradle.jvmargs=-Xmx3g -Dfile.encoding=UTF-8
+          android.useAndroidX=true
+          android.nonTransitiveRClass=true
+          kotlin.code.style=official
+          EOF_19
+          cat > "settings.gradle.kts" <<'EOF_20'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = "StudyOS"
+          include(":app")
+          EOF_20
+
+      - name: Build debug APK
+        shell: bash
+        run: |
+          set -o pipefail
+          gradle assembleDebug --no-daemon --stacktrace 2>&1 | tee build.log
+
+      - name: Show compiler errors
+        if: failure()
+        run: |
+          grep -E "^e: |What went wrong|error:" build.log | head -60
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: StudyOS-debug-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
